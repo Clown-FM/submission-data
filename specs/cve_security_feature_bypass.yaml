@@ -1,0 +1,190 @@
+# CVE 复现 — 安全功能绕过（CSP/seccomp/sandbox 等）
+target_type: security_feature_bypass
+label: "安全功能绕过"
+attack_surface: remote
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "cmd"
+  requires_startup: true
+
+# verify.sh 自启动配置
+startup:
+  port: 8080
+  health: "/"
+  cmd: ""
+
+type_instruction: |
+  【安全功能绕过模式】漏洞核心是绕过/篡改了安全机制，
+  但不直接产生数据泄露或权限提升。
+
+  本类型与信息泄露的区别：
+  - 信息泄露：直接读到了本该不可访问的数据 ✅
+  - 安全功能绕过：成功篡改了安全策略，但不要求读取到数据
+
+  验收标准：
+  - 证明 bypass 前安全功能生效（如 CSP 限制 script-src 'self'）
+  - 证明 bypass 后安全功能被绕过（如 script-src 变为 https://evil.com）
+  - 对比两个状态，得出结论：安全策略可被篡改
+  - ❌ 不需要伪造或模拟"泄露了敏感数据"
+  
+  🔴 此 CVE 类型涉及 Web/网络服务，使用 docker_setup 时请传 entrypoint_mode="cmd"（保留 Dockerfile CMD 自动启动服务），
+  并视需要传 port_mappings 暴露端口（如 port_mappings=["3001:3001"]）。
+
+acceptance: |
+  ## 安全功能绕过验收标准
+
+  安全功能绕过的验证通过以下对比确认：
+
+  ━━ [1/3] bypass 前状态 ━━
+  安全功能处于生效状态（如 CSP header 正确限制、seccomp 白名单生效）
+
+  ━━ [2/3] bypass 后状态 ━━
+  应用安全机制的输入漏洞，绕过了该功能（如 CSP 被注入额外指令）
+
+  ━━ [3/3] 对比结论 ━━
+  证明 bypass 前后的安全策略不同，且 bypass 后的保护低于 bypass 前。
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 安全功能绕过验证
+    1. 部署含漏洞的服务（或构造测试环境）
+    2. 展示 bypass 前的安全策略
+    3. 提交绕过 payload
+    4. 展示 bypass 后的安全策略
+    5. 对比输出，不伪造泄露数据
+  sections:
+    - title: "通用规则"
+      rules:
+        - "🔴 exp.sh 必须是 bash 脚本（#!/bin/bash），禁止用 Python 或其他语言"
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "🔴 禁止伪造/模拟敏感数据——只验证安全策略本身的变化"
+        - "末尾输出 EXP 完成"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本
+    按三段式执行：bypass 前 → bypass 后 → 对比结论。可反复运行。
+  sections:
+    - title: "━━━ [1/3] bypass 前状态 ━━━"
+      text: "展示安全功能处于生效状态的证据"
+    - title: "━━━ [2/3] bypass 后状态 ━━━"
+      text: |
+        运行 exp.sh 触发绕过，展示绕过后的安全策略变化。
+        - CSP 注入：对比 bypass 前后的 header 或页面行为
+        - seccomp 绕过：对比 syscall 可用性变化
+        - SOP 绕过：展示跨域请求结果变化
+    - title: "━━━ [3/3] 对比结论 ━━━"
+      text: "总结 bypass 前后的差异，得出结论：安全策略可被篡改"
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+
+    # 自动启动（Agent 替换 __START_CMD__ 后生效，未替换则跳过）
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: barrier]
+    echo "━━━ [阶段 1/3] 权限屏障 ━━━"
+    BARRIER_CODE=$(curl -s -o /dev/null -w "%{http_code}" __BARRIER_URL__)
+    if [ "$BARRIER_CODE" = "401" ] || [ "$BARRIER_CODE" = "403" ]; then
+        echo "  ✅ 屏障正常 — HTTP $BARRIER_CODE"
+    else
+        echo "  ⚠️  屏障异常 — HTTP $BARRIER_CODE"
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ 运行 exp.sh ━━━"
+    bash /tmp/exp.sh
+    EXP_EXIT=$?
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if [ "$EXP_EXIT" -eq 0 ]; then
+        echo "✅ 绕过确认"
+    else
+        echo "❌ 绕过未确认"
+        exit 1
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    echo "验证完成"
+
+  end_marker: "echo '安全功能绕过验证完成'"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: security_feature_bypass。写入前必须确认：
+
+      1. 验证思路是"bypass 前后对比"，不是"泄露了敏感数据"
+      2. 不使用 set -e
+      3. 阶段 1 展示 bypass 前的安全策略
+      4. 阶段 2 运行 bash /tmp/exp.sh 触发绕过
+      5. 阶段 3 对比得出结论
+      6. ❌ 禁止伪造敏感数据文件（/tmp/leaked_data）
+      7. 🔴 如果 CVE 涉及 CSP/浏览器策略，优先用 exppilot-xss 镜像
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否有三个阶段标题？□
+      2. 阶段 1 是否展示了 bypass 前的安全策略状态？□
+      3. 阶段 2 是否运行了 bash /tmp/exp.sh？□
+      4. 阶段 3 是否有对比结论输出？□
+      5. 最后一行是否以 '安全功能绕过验证完成' 结尾？□
+      6. ❌ verify.sh 是否检查了 /tmp/leaked_data？□
+         → 如果是 → 删掉，安全功能绕过不需要伪造泄露数据
+      7. 是否有 set -e？□
+         → 如果有 → 删除
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: security_feature_bypass。写入前必须确认：
+
+      1. 第一行是 #!/bin/bash
+      2. 不使用 set -e
+      3. ❌ 禁止伪造/模拟敏感数据，只验证安全策略本身的变化
+      4. 末尾输出 EXP 完成
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 第一行是否是 #!/bin/bash？□
+      2. 是否有 set -e？□
+         → 如果有 → 删除
+      3. 是否伪造了敏感数据（echo "api_key=..." > /tmp/leaked_data）？□
+         → 如果是 → 删掉，只对比安全策略变化
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+checks:
+  - name: "verify.sh 最后一行包含 '安全功能绕过验证完成'"
+    on_fail: "确保 verify.sh 末尾输出 '安全功能绕过验证完成'"
+  - name: "verify.sh 包含 bypass 前后对比逻辑"
+    on_fail: "确保 verify.sh 包含 bypass 前和 bypass 后的状态对比"
+  - name: "❌ verify.sh 未检查 /tmp/leaked_data（本类型不伪造泄露数据）"
+    on_fail: "删除 /tmp/leaked_data 相关检查——安全功能绕过不需要伪造泄露数据"
+  - name: "verify.sh 展示了 bypass 前后的策略差异"
+    on_fail: "确保阶段 1 和阶段 2 输出的安全策略不一致（证明绕过成功）"

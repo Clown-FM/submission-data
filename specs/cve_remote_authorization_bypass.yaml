@@ -1,0 +1,213 @@
+# CVE 复现 — 远程授权绕过（安全控制失效：令牌过期、速率限制、访问范围）
+target_type: remote_authorization_bypass
+label: "远程授权绕过"
+attack_surface: remote
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "cmd"
+  requires_startup: true
+
+# verify.sh 自启动配置
+startup:
+  port: 8080
+  health: "/"
+  cmd: ""
+
+type_instruction: |
+  【远程授权绕过模式】用户选择远程授权绕过目标。证明远程服务的
+  安全控制（令牌过期时间、速率限制、访问范围等）可以在预期边界外
+  被突破。验收标准：展示控制意图与实际行为之间的偏差。
+  
+  🔴 此 CVE 类型涉及 Web/网络服务，使用 docker_setup 时请传 entrypoint_mode="cmd"（保留 Dockerfile CMD 自动启动服务），
+  并视需要传 port_mappings 暴露端口（如 port_mappings=["3001:3001"]）。
+
+acceptance: |
+  ## 远程授权绕过验收标准
+
+  远程授权绕过漏洞复现必须达到：**攻击者证明远程服务的安全控制
+  在预期边界外失效**。
+
+  **二段式验证（verify.sh 必须按此顺序执行）：**
+
+  ### 阶段 1：控制边界定义
+  展示管理员的预期安全边界（如设置 tokenDuration=5 分钟、
+  速率限制=100次/小时、访问范围=/data/）。证明控制应在此边界内生效。
+
+  ### 阶段 2：边界失效验证
+  运行 exp.sh 触发授权绕过，展示控制已在预期边界外失效
+  （如 5 分钟令牌在 30 分钟后仍有效、速率限制被突破等）。
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 漏洞利用（远程授权绕过）
+    负责触发漏洞并展示安全控制边界被突破。
+  sections:
+    - title: "通用规则"
+      rules:
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "输出以 EXP 完成 结尾"
+        - "展示预期边界与实际行为之间的偏差"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本
+    env.sh 负责启动服务，exp.sh 负责执行绕过逻辑，verify.sh 直接调用并验证结果。
+  sections:
+    - title: "运行 exp.sh"
+      text: |
+        exp.sh 负责启动服务、展示控制边界、执行绕过。
+        ⚠️ 这是 verify.sh 的第一步。所有 curl 检查（包括边界定义阶段的演示）
+        必须在服务启动之后执行。如果先做边界演示再做 exp.sh，必须在演示前
+        加服务就绪检查（curl health endpoint 或自行启动服务）。
+      code: |
+        echo "============================================"
+        echo "  CVE-XXXX-XXXXX 远程授权绕过验证"
+        echo "============================================"
+        echo ""
+        echo "━━━ 运行 exp.sh ━━━"
+        bash /tmp/exp.sh
+        echo ""
+    - title: "验证绕过结果"
+      text: |
+        确认安全控制边界已被突破：
+      code: |
+        echo "━━━ 绕过验证结果 ━━━"
+        echo "  远程授权绕过确认 — 安全控制在预期边界外失效"
+        echo "============================================"
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+
+    # 自动启动（Agent 替换 __START_CMD__ 后生效，未替换则跳过）
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: barrier]
+    echo "━━━ [阶段 1/3] 权限屏障 ━━━"
+    BARRIER_CODE=$(curl -s -o /dev/null -w "%{http_code}" __BARRIER_URL__)
+    if [ "$BARRIER_CODE" = "401" ] || [ "$BARRIER_CODE" = "403" ]; then
+        echo "  ✅ 屏障正常 — HTTP $BARRIER_CODE"
+    else
+        echo "  ⚠️  屏障异常 — HTTP $BARRIER_CODE"
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ 运行 exp.sh ━━━"
+    bash /tmp/exp.sh
+    EXP_EXIT=$?
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if [ "$EXP_EXIT" -eq 0 ]; then
+        echo "✅ 绕过确认"
+    else
+        echo "❌ 绕过未确认"
+        exit 1
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    echo "验证完成"
+
+  end_marker: "远程授权控制验证完成"
+
+files:
+  - name: exp.sh
+    desc: "漏洞利用（远程授权绕过）"
+    category: exploit
+    end_marker: "EXP 完成"
+    rules:
+      - "不使用 set -e"
+      - "展示预期边界与实际行为之间的偏差"
+      - "输出以 EXP 完成 结尾"
+
+  - name: verify.sh
+    desc: "验证脚本（二段式）"
+    category: verify
+    end_marker: "远程授权控制验证完成"
+    rules:
+      - "第一步执行 bash /tmp/exp.sh（env.sh 负责启动服务，exp.sh 负责执行绕过）"
+      - "验证绕过结果，确认控制边界已被突破"
+      - "用 ✅/❌ 标记验证结果"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: remote_authorization_bypass。写入前必须确认：
+
+      1. 第一步执行 bash /tmp/exp.sh（env.sh 负责启动服务，exp.sh 负责执行绕过）
+      2. exp.sh 运行后验证授权绕过结果（确认控制边界已被突破）
+      3. 🔴 不需要 whoami/id/sudo —— 用 curl/工具验证
+      4. 不使用 set -e
+      5. 用 ✅/❌ 标记验证结果
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否第一步执行了 bash /tmp/exp.sh？□
+         → 如果没有 → 用 write_file 重写
+      2. 是否展示了授权绕过确认？□
+         → 如果没有 → 用 write_file 重写
+      3. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      4. 是否用 curl/工具而非 whoami？□
+         → 如果出现 whoami/id/sudo → 用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: remote_authorization_bypass。写入前必须确认：
+
+      1. 不使用 set -e，清理命令加 2>/dev/null || true
+      2. 展示预期边界与实际行为之间的偏差
+      3. 最后一行必须是 echo "EXP 完成"（禁止裸文本，bash 会当命令执行）
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      2. 最后一行是否严格等于 EXP 完成？□
+         → 如果不是或为裸文本 → 改为 echo "EXP 完成"，用 write_file 重写
+      3. 是否展示了预期边界与实际行为之间的偏差？□
+         → 如果没有 → 用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+      10. exp.sh 开头是否清理了 CVE_WORKDIR 工作空间？□
+         → 如果没有 → 在开头加 rm -rf "$CVE_WORKDIR" && mkdir -p "$CVE_WORKDIR"，用 write_file 重写
+      11. 如果 exp.sh 包含编译命令（go build/gcc/mvn），是否用 background=True 启动而非 timeout 等待？□
+         → 如果是同步编译 → 改为 background=True 启动 + 轮询检查二进制
+checks:
+  - name: "exp.sh 成功展示控制边界被突破，最后一行是 EXP 完成"
+    on_fail: "确保 exp.sh 展示授权绕过确认，最后一行严格等于 EXP 完成"
+  - name: "verify.sh 阶段 1 展示了预期安全控制边界"
+    on_fail: "在 verify.sh 阶段 1 明确定义安全控制边界"
+  - name: "verify.sh 最后一行严格等于 end_marker，无多余 exit/echo/空行"
+    on_fail: "删除 verify.sh 末尾多余的 exit/echo/空行"

@@ -1,0 +1,385 @@
+# CVE 复现 — 远程信息泄露（应用层屏障：URL ACL、认证、协议）
+target_type: remote_information_disclosure
+label: "远程信息泄露"
+attack_surface: remote
+
+# 推荐的 exploit 模块（Agent 优先使用，不强制）
+recommended_modules:
+  deploy:
+    - "exploit_modules/application/deploy/undici_vulnerable.py"
+  capture:
+    - "exploit_modules/application/capture/multipart_boundary.py"
+  analyze:
+    - "exploit_modules/application/analyze/math_random_prng.py"
+  forge: []
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "cmd"
+  requires_startup: true
+
+# verify.sh 自启动配置
+startup:
+  port: 8080
+  health: "/"
+  cmd: ""
+
+type_instruction: |
+  【远程信息泄露模式】用户选择远程信息泄露目标。证明未经认证的远程
+  攻击者可读取应用层受保护数据。屏障在应用层（URL 访问控制、认证
+  检查、协议限制），不在 OS 文件权限。验收标准：展示泄露的敏感数据，
+  并评估该数据的实际危害。
+
+  🔴 此 CVE 类型涉及 Web/网络服务，使用 docker_setup 时请传 entrypoint_mode="cmd"（保留 Dockerfile CMD 自动启动服务），
+  并视需要传 port_mappings 暴露端口（如 port_mappings=["3001:3001"]）。
+
+  ### 验证优先级
+
+  验证目标应用时应遵循以下优先级：
+
+  1. **搭建真实目标应用**（优先）
+     尝试使用 Docker 镜像 / apt-get install / 源码编译等方式部署真实的受影响版本。
+     在真实目标上触发漏洞后 → verification_method = "real"
+
+  2. **模拟验证**（仅当方案 1 明确不可行时）
+     如果无法搭建真实环境（无 Docker 镜像、无法下载、依赖缺失等），
+     可以使用 Mock 服务演示漏洞原语，但必须：
+     - 在 exp.sh 开头注释中写明无法搭建的原因
+     - _result.json 的 verification_method 标注 "simulated"
+     - summary 以 [SIMULATED] 开头
+
+  🔴 两种方式框架都接受。核心要求是**标注诚实**——模拟验证标 simulated，真实验证标 real，
+  不把模拟结果标注为真实复现。
+
+acceptance: |
+  ## 远程信息泄露验收标准
+
+  远程信息泄露漏洞复现必须达到：**远程攻击者绕过应用层访问控制，
+  成功读取通常不可访问的敏感数据**.
+
+  屏障在应用层而非 OS 层——Vite、Spring Boot、Nginx 等应用框架的
+  URL ACL、认证检查、路径检查被绕过。
+
+  ## 三段式验证（verify.sh 必须按此顺序执行）
+
+  ### 阶段 1：应用层权限屏障
+  展示正常请求被应用层访问控制拒绝（403/401/302），证明资源本应受保护。
+
+  ### 阶段 2：泄露内容展示
+  运行 exp.sh 触发漏洞，绕过应用层屏障，收集泄露数据到 /tmp/leaked_data。
+  用 head（≤15 行）展示泄露内容的关键部分。
+
+  ### 阶段 3：影响评估
+  扫描 /tmp/leaked_data 中的敏感信息类型（凭据/密钥/令牌/源码/PII），
+  用 🚨 图标标注发现的高危项，并用一句话说明每项的实际危害。
+  严禁编造不存在的凭据或危害。
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 漏洞利用（远程信息窃取）
+    负责触发漏洞并收集泄露的敏感数据。不做提权、不创建 bind shell。
+  sections:
+    - title: "通用规则"
+      rules:
+        - "🔴 exp.sh 必须是 bash 脚本（#!/bin/bash）。如需用 Python/Node.js 启动辅助服务（如 mock 服务器），从 exp.sh 中调用，不可将 exp.sh 本身写成 Python 脚本"
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "🔴 exp.sh 只做两件事：① 触发漏洞读取受限数据 ② 写入 /tmp/leaked_data"
+        - "exp.sh 假设目标服务已在运行（由 Docker entrypoint 或 verify.sh 启动），直接触发漏洞"
+        - "泄漏的数据写入 /tmp/leaked_data"
+        - "末尾输出 泄露数据已收集 并展示文件大小（wc -c）"
+    - title: "数据收集规范"
+      rules:
+        - "泄露数据保存到 /tmp/leaked_data，不做截断"
+        - "如果漏洞需要分多次读取，合并到 /tmp/leaked_data"
+        - "如果目标文件不存在，尝试常见变体并记录尝试过程"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本
+    先调用 exp.sh（启动服务+触发泄露），再按三段式验证：应用层屏障 → 泄露内容 → 影响评估。
+  sections:
+    - title: "阶段 0 — 运行 exp.sh"
+      text: |
+        exp.sh 负责启动服务并触发泄露。之后验证脚本独立验证结果。
+      code: |
+        echo "============================================"
+        echo "  CVE-XXXX-XXXXX 远程信息泄露验证"
+        echo "============================================"
+        echo ""
+        bash /tmp/exp.sh
+        echo ""
+    - title: "阶段 1 — 应用层权限屏障"
+      text: |
+        展示正常请求被应用层拒绝（不使用绕过参数），证明资源受应用层保护。
+        🔴 不要用 whoami/id/ls -l——这些是 OS 层检查，对远程 Web 漏洞无意义。
+        屏障是：正常请求被拒 → 绕过请求成功。
+        ⚠️ 执行 barrier 检查前，确保目标服务已在运行。如果服务尚未就绪，
+        必须先启动服务再执行 curl 检查，否则会得到 HTTP 000（连接失败）。
+      code: |
+        echo "============================================"
+        echo "  CVE-XXXX-XXXXX 远程信息泄露验证"
+        echo "============================================"
+        echo ""
+        echo "━━━ [阶段 1/3] 应用层权限屏障 ━━━"
+        echo ""
+        echo "[屏障检查] 正常请求（无绕过参数）："
+        # Agent 根据实际漏洞替换 URL 和预期状态码
+        curl -s -o /dev/null -w "  状态码: %{http_code} (预期: 403/401 — 拒绝访问)" "<正常请求URL>"
+        echo ""
+        echo "  ↑ 应用层访问控制生效，资源受保护"
+    - title: "阶段 2 — 泄露内容展示"
+      text: |
+        运行 exp.sh 触发漏洞，绕过应用层屏障：
+      code: |
+        echo ""
+        echo "━━━ [阶段 2/3] 泄露内容展示 ━━━"
+        bash /tmp/exp.sh
+
+        if [ -f /tmp/leaked_data ] && [ -s /tmp/leaked_data ]; then
+            echo ""
+            LEAKED_SIZE=$(wc -c < /tmp/leaked_data)
+            echo "✅ 远程信息泄露确认 — 成功读取 ${LEAKED_SIZE} 字节的受限数据"
+            echo ""
+            echo "--- 泄露内容预览（前 15 行）---"
+            head -15 /tmp/leaked_data
+            echo ""
+        else
+            echo "❌ 未检测到泄露数据"
+            exit 1
+        fi
+    - title: "阶段 3 — 影响评估"
+      text: |
+        扫描泄露内容中的敏感信息类型，标注高危项：
+      code: |
+        echo "━━━ [阶段 3/3] 影响评估 ━━━"
+        echo ""
+        LEAKED=$(cat /tmp/leaked_data)
+
+        FOUND=0
+
+        if echo "$LEAKED" | grep -qiE "(password|passwd|pwd)\s*[=:]\s*\S+"; then
+            echo "🚨 明文凭据 — 可能被用于直接登录目标系统"
+            FOUND=1
+        fi
+        if echo "$LEAKED" | grep -qiE "(secret|SECRET)\s*[=:]\s*\S+"; then
+            echo "🚨 密钥/Secret — 可能被用于伪造签名或解密敏感数据"
+            FOUND=1
+        fi
+        if echo "$LEAKED" | grep -qiE "-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"; then
+            echo "🚨 私钥 — 可能被用于免密 SSH 登录或身份冒充"
+            FOUND=1
+        fi
+        if echo "$LEAKED" | grep -qiE "(api[_-]?key|token|bearer)\s*[=:]\s*\S+"; then
+            echo "🚨 API 密钥/Token — 可能被用于调用受保护的 API 接口"
+            FOUND=1
+        fi
+        if echo "$LEAKED" | grep -qiE "(jwt[_-]?secret|jwt[_-]?key|signing[_-]?key)"; then
+            echo "🚨 JWT 签名密钥 — 可能被用于伪造任意用户的认证令牌"
+            FOUND=1
+        fi
+        if echo "$LEAKED" | grep -qiE "(database|db|mysql|postgres|redis|mongodb|mongo)[^=]*://[^ ]+"; then
+            echo "🚨 数据库连接串 — 包含主机、端口、凭据，可直接连接数据库"
+            FOUND=1
+        fi
+        if echo "$LEAKED" | grep -qiE "@(gmail|yahoo|outlook|qq|163)"; then
+            echo "⚠️  邮箱地址 — 可能被用于钓鱼攻击或账号恢复"
+            FOUND=1
+        fi
+
+        if [ "$FOUND" -eq 0 ]; then
+            echo "ℹ️  未检测到已知敏感模式，但该数据的非授权访问本身已构成安全事件"
+            echo "   泄露数据大小: $(wc -c < /tmp/leaked_data) 字节"
+        fi
+
+        echo ""
+        echo "============================================"
+        echo "  远程信息泄露验证完成"
+        echo "============================================"
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+
+    # 自动启动（Agent 替换 __START_CMD__ 后生效，未替换则跳过）
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: barrier]
+    echo "━━━ [阶段 1/3] 应用层权限屏障 ━━━"
+    BARRIER_CODE=$(curl -s -o /dev/null -w "%{http_code}" __BARRIER_URL__)
+    if [ "$BARRIER_CODE" = "401" ] || [ "$BARRIER_CODE" = "403" ]; then
+        echo "  ✅ 屏障正常 — HTTP $BARRIER_CODE"
+    else
+        echo "  ⚠️  屏障异常 — HTTP $BARRIER_CODE"
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ [阶段 2/3] 泄露内容展示 ━━━"
+    bash /tmp/exp.sh
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if [ -f /tmp/leaked_data ] && [ -s /tmp/leaked_data ]; then
+        LEAKED_SIZE=$(wc -c < /tmp/leaked_data)
+        echo "✅ 确认 — 成功读取 ${LEAKED_SIZE} 字节"
+        head -15 /tmp/leaked_data
+    else
+        echo "❌ 未检测到泄露数据"
+        exit 1
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: impact_assessment]
+    echo "━━━ [阶段 3/3] 影响评估 ━━━"
+    LEAKED=$(cat /tmp/leaked_data 2>/dev/null)
+    FOUND=0
+    for kw in "password" "secret" "api_key" "token" "PRIVATE KEY"; do
+        echo "$LEAKED" | grep -qi "$kw" && echo "  🚨 含敏感关键字: $kw" && FOUND=1
+    done
+    [ "$FOUND" -eq 0 ] && echo "  ℹ️  未检测到已知敏感模式"
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    echo "远程信息泄露验证完成"
+  end_marker: "远程信息泄露验证完成"
+
+files:
+  - name: exp.sh
+    desc: "漏洞利用（远程信息窃取）"
+    category: exploit
+    end_marker: "泄露数据已收集"
+    rules:
+      - "🔴 exp.sh 必须是 bash 脚本（#!/bin/bash），禁止用 Python"
+      - "不使用 set -e，清理命令加 2>/dev/null || true"
+      - "只做两件事：① 触发漏洞读取受限数据 ② 写入 /tmp/leaked_data"
+      - "泄露数据写入 /tmp/leaked_data"
+      - "末尾输出 泄露数据已收集 并展示文件大小"
+
+  - name: verify.sh
+    desc: "验证脚本（三段式）"
+    category: verify
+    end_marker: "远程信息泄露验证完成"
+    rules:
+      - "按三段式执行：阶段 1 应用层屏障 → 阶段 2 泄露内容 → 阶段 3 影响评估"
+      - "🔴 阶段 1：展示正常请求被拒绝（curl 返回 403/401），不要用 whoami/ls -l"
+      - "阶段 2：运行 bash /tmp/exp.sh → 检查 /tmp/leaked_data → head 展示"
+      - "阶段 3：逐项扫描泄露内容中的敏感信息模式（密码/密钥/令牌/私钥…）"
+      - "🔴 阶段 3 禁止编造不存在的凭据，必须基于实际泄露内容扫描"
+      - "最后一行严格等于 远程信息泄露验证完成"
+      - "禁止在末尾追加额外行（exit/echo/空行）"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: remote_information_disclosure。写入前必须确认：
+
+      1. 最后一行将严格等于 "远程信息泄露验证完成" — 不能是 echo/cat/空行
+      2. 阶段 1 使用 curl 验证 HTTP 状态码（403/401），禁止用 whoami / id / ls -l
+      3. 不使用 set -e
+      4. 三个阶段标题格式: ━━━ [阶段 X/3] ... ━━━
+      5. 阶段 2 运行 bash /tmp/exp.sh，检查 /tmp/leaked_data
+      6. 阶段 3 用 grep 扫描泄露内容中的敏感模式，禁止编造不存在的凭据
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 最后一行是否严格等于 "远程信息泄露验证完成"？□
+         → 如果末尾有额外空行、exit、echo、===== 装饰线 → 用 write_file 重写整个文件
+      2. 阶段 1 是否用 curl 而非 whoami/ls -l？□
+         → 如果出现 whoami/id/ls -l → 用 write_file 重写整个文件
+      3. 是否有 set -e？□
+         → 如果有 → 删除 set -e 行，用 write_file 重写
+      4. 是否包含三个阶段标题（━━━ [阶段 1/3] / [阶段 2/3] / [阶段 3/3]）？□
+         → 如果缺少 → 用 write_file 重写整个文件
+      5. 阶段 3 的 grep 扫描是否基于实际泄露内容（而非编造）？□
+         → 如果 grep 匹配的是不可能存在的模式 → 用 write_file 重写
+      6. 末尾是否在 end_marker 之前又用 cat/head dump 了 /tmp/leaked_data？□
+         → 阶段 2 已经 head -15 展示过了，末尾只需输出 end_marker，删除多余的 cat/head
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+
+      8. 🔴 模拟标注检查：
+         如果 exp.sh 使用 Mock 服务返回数据（非真实目标），
+         这是允许的，但必须标注。检查 exp.sh 开头是否有:
+           # [SIMULATED] 原因: ...
+         并在写 _result.json 时确认 verification_method="simulated"。□
+         → 如果没标注 → 在 exp.sh 开头补充注释，重写
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: remote_information_disclosure。写入前必须确认：
+
+      1. 第一行是 #!/bin/bash（绝对禁止用 Python 或其他语言）
+      2. 最后一行将严格等于 "泄露数据已收集"
+      3. 不使用 set -e，清理命令加 2>/dev/null || true
+      4. 只做两件事：① 触发漏洞读取受限数据 ② 写入 /tmp/leaked_data
+      5. 禁止在 exp.sh 中包含服务启动命令（服务由 Agent 在脚本外单独启动）
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 第一行是否是 #!/bin/bash？□
+         → 如果不是 → 用 write_file 重写
+      2. 最后一行是否严格等于 "泄露数据已收集"？□
+         → 如果不是或为裸文本 → 改为 echo "泄露数据已收集"，用 write_file 重写
+      3. 是否有 set -e？□
+         → 如果有 → 删除 set -e 行，用 write_file 重写
+      4. 目标服务是否已在正常运行？（verify.sh 中没有 HTTP 000）□
+         → 如果是 HTTP 000 → verify.sh 缺少 __START_CMD__ 自启动，检查 __START_CMD__ 是否被替换
+      5. 泄露数据是否写入 /tmp/leaked_data 而非其他路径？□
+         → 如果不是 → 用 write_file 重写
+      6. 🔴 标注一致性：你的 exp.sh 是否使用了 Mock 服务来模拟漏洞行为？
+         （如自己写的 Python/Node.js HTTP 服务、模拟数据返回等）
+         如果是 → 你正在做的是模拟验证。请在 exp.sh 开头加一行注释：
+           # [SIMULATED] 原因: <简要说明为什么不能搭真实环境>
+         并在写 _result.json 时确保 verification_method="simulated"，
+         summary 以 [SIMULATED] 开头。□
+         → 如果标注了 simulated 但没写原因 → 补充注释，重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+      10. exp.sh 开头是否清理了 CVE_WORKDIR 工作空间？□
+         → 如果没有 → 在开头加 rm -rf "$CVE_WORKDIR" && mkdir -p "$CVE_WORKDIR"，用 write_file 重写
+      11. 如果 exp.sh 包含编译命令（go build/gcc/mvn），是否用 background=True 启动而非 timeout 等待？□
+         → 如果是同步编译 → 改为 background=True 启动 + 轮询检查二进制
+checks:
+  - name: "exp.sh 第一行是 #!/bin/bash（不是 #!/usr/bin/env python3）"
+    on_fail: "将 exp.sh 改为 bash 脚本，以 #!/bin/bash 开头"
+  - name: "exp.sh 中将泄露数据写入了 /tmp/leaked_data 且文件非空"
+    on_fail: "确保 exp.sh 触发漏洞后将泄露数据写入 /tmp/leaked_data"
+  - name: "exp.sh 末尾输出 泄露数据已收集"
+    on_fail: "确保 exp.sh 最后一行严格等于 泄露数据已收集"
+  - name: "verify.sh 按三段式结构执行（阶段 1/3, 2/3, 3/3）"
+    on_fail: "确保 verify.sh 包含三个阶段标题，按应用层屏障 → 泄露内容 → 影响评估 顺序执行"
+  - name: "verify.sh 阶段 1 展示了正常请求被拒绝（curl 403/401），未使用 whoami/ls -l"
+    on_fail: "在 verify.sh 阶段 1 用 curl 展示正常请求返回 403/401，不要用 whoami/ls -l（那是 OS 层检查）"
+  - name: "verify.sh 运行了 bash /tmp/exp.sh 并检查了 /tmp/leaked_data"
+    on_fail: "确保 verify.sh 开头 bash /tmp/exp.sh，然后 if [ -f /tmp/leaked_data ] 检查"
+  - name: "verify.sh 最后一行严格等于 远程信息泄露验证完成"
+    on_fail: "删除 verify.sh 末尾多余的 exit/echo/空行，确保最后一行严格等于 远程信息泄露验证完成"
+  - name: "verify.sh 阶段 3 扫描了泄露内容中的敏感模式（grep 检测）"
+    on_fail: "确保 verify.sh 阶段 3 包含对 /tmp/leaked_data 的 grep 敏感模式扫描"

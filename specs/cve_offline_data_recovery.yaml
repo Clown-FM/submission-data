@@ -1,0 +1,205 @@
+# CVE 复现 — 离线数据恢复（无在线权限边界）
+target_type: offline_data_recovery
+label: "离线数据恢复"
+attack_surface: none
+
+type_instruction: |
+  【离线数据恢复模式】用户选择离线数据恢复目标。这类漏洞不需要
+  绕过实时权限边界——敏感数据残留在内存、swap、core dump 或其它
+  离线文件中，攻击者拿到数据副本后即可恢复。
+
+  验收标准：提供输入文件（dump/镜像/core 文件），运行 PoC，
+  确认输出了可识别的敏感内容。不需要 whoami/ls -l 权限检查。
+
+acceptance: |
+  ## 离线数据恢复验收标准
+
+  此类漏洞不涉及在线权限绕过。验证只需要证明：
+  **给定离线数据文件，可以恢复出可识别的敏感内容**。
+
+  ### 验证步骤（verify.sh 按此顺序）
+
+  #### 阶段 1：展示输入数据
+  展示输入文件的存在和基本信息（文件大小、类型），说明这是
+  离线获取的内存 dump / core 文件 / 镜像文件。不需要权限检查。
+
+  #### 阶段 2：运行提取工具
+  运行 PoC，从输入文件中提取/恢复敏感数据。
+
+  #### 阶段 3：展示恢复结果
+  展示恢复出的敏感内容（密码片段、密钥、凭据等）。
+  用 ✅/❌ 标记是否成功恢复。
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 数据提取（离线恢复）
+    负责运行提取工具，从离线数据文件中恢复敏感信息。
+  sections:
+    - title: "通用规则"
+      rules:
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "输入文件路径通过环境变量或参数传入，不硬编码"
+        - "提取结果写入 /tmp/recovered_data"
+        - "末尾输出 数据恢复验证完成 并展示恢复结果摘要"
+    - title: "输入文件处理"
+      rules:
+        - "如果 PoC 需要特定的输入文件格式，exp.sh 负责准备（如生成 sample dump）"
+        - "输入文件放在 /tmp/ 下，确保可读"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本
+    按三段式执行：输入数据展示 → 提取工具运行 → 恢复结果展示。
+    可反复运行。
+  sections:
+    - title: "阶段 1 — 输入数据展示"
+      text: |
+        展示输入文件的信息，说明数据来源。
+        🔴 不需要 whoami/id/ls -l 权限检查——这是离线数据恢复，无权限边界。
+      code: |
+        echo "============================================"
+        echo "  CVE-XXXX-XXXXX 离线数据恢复验证"
+        echo "============================================"
+        echo ""
+        echo "━━━ [阶段 1/3] 输入数据展示 ━━━"
+        echo ""
+        INPUT_FILE=<输入文件路径>
+        echo "输入文件: $INPUT_FILE"
+        ls -lh "$INPUT_FILE" 2>/dev/null && echo "  ↑ 离线数据副本（内存 dump / core 文件）"
+        echo "  注意：此类漏洞不涉及在线权限绕过，"
+        echo "        攻击者通过其他途径获取数据副本后离线恢复。"
+    - title: "阶段 2 — 数据提取"
+      text: |
+        运行 exp.sh 执行提取工具：
+      code: |
+        echo ""
+        echo "━━━ [阶段 2/3] 数据提取 ━━━"
+        bash /tmp/exp.sh
+        echo ""
+    - title: "阶段 3 — 恢复结果展示"
+      text: |
+        展示恢复出的敏感内容：
+      code: |
+        echo "━━━ [阶段 3/3] 恢复结果展示 ━━━"
+        echo ""
+        if [ -f /tmp/recovered_data ] && [ -s /tmp/recovered_data ]; then
+            echo "✅ 敏感数据恢复成功"
+            echo ""
+            echo "--- 恢复内容 ---"
+            cat /tmp/recovered_data
+            echo ""
+            echo "============================================"
+            echo "  数据恢复验证完成"
+            echo "============================================"
+        else
+            echo "❌ 未恢复出敏感数据"
+            exit 1
+        fi
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ 运行 exp.sh ━━━"
+    bash /tmp/exp.sh
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if [ -f /tmp/recovered_data ] && [ -s /tmp/recovered_data ]; then
+        echo "✅ 确认 — 成功恢复 $(wc -c < /tmp/recovered_data) 字节"
+        head -15 /tmp/recovered_data
+    else
+        echo "❌ 恢复失败"
+        exit 1
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    echo "验证完成"
+
+  end_marker: "数据恢复验证完成"
+
+files:
+  - name: exp.sh
+    desc: "数据提取工具"
+    category: exploit
+    end_marker: "数据恢复验证完成"
+    rules:
+      - "不使用 set -e，清理命令加 2>/dev/null || true"
+      - "运行提取工具，结果写入 /tmp/recovered_data"
+      - "末尾输出 数据恢复验证完成"
+
+  - name: verify.sh
+    desc: "验证脚本（三段式）"
+    category: verify
+    end_marker: "数据恢复验证完成"
+    rules:
+      - "阶段 1：展示输入文件信息，不需要 whoami/id 权限检查"
+      - "阶段 2：运行 bash /tmp/exp.sh"
+      - "阶段 3：展示 /tmp/recovered_data 中的恢复结果"
+      - "🔴 禁止在阶段 1 使用 whoami/id/ls -l 权限检查"
+      - "用 ✅/❌ 标记验证结果"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: offline_data_recovery。写入前必须确认：
+
+      1. 🔴 阶段 1 展示输入文件信息，但禁止用 whoami/id/ls -l 做权限检查
+      2. 阶段 2 执行 bash /tmp/exp.sh
+      3. 阶段 3 检查 /tmp/recovered_data 并展示恢复内容
+      4. 不使用 set -e
+      5. 最后输出 数据恢复验证完成（必须用 echo 输出，禁止裸文本）
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 阶段 1 是否用了 whoami/id/ls -l 权限检查？□
+         → 如果有 → 删除，用 write_file 重写（离线恢复不需要权限边界）
+      2. 是否有三个阶段标题？□
+         → 如果缺少 → 用 write_file 重写
+      3. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      4. 最后是否输出 数据恢复验证完成？□
+         → 如果不是 → 用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: offline_data_recovery。写入前必须确认：
+
+      1. 运行提取工具，结果写入 /tmp/recovered_data
+      2. 不使用 set -e，清理命令加 2>/dev/null || true
+      3. 最后输出 数据恢复验证完成
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      2. 结果是否写入 /tmp/recovered_data？□
+         → 如果不是 → 用 write_file 重写
+      3. 最后是否输出 数据恢复验证完成？□
+         → 如果不是 → 用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+      10. exp.sh 开头是否清理了 CVE_WORKDIR 工作空间？□
+         → 如果没有 → 在开头加 rm -rf "$CVE_WORKDIR" && mkdir -p "$CVE_WORKDIR"，用 write_file 重写
+      11. 如果 exp.sh 包含编译命令（go build/gcc/mvn），是否用 background=True 启动而非 timeout 等待？□
+         → 如果是同步编译 → 改为 background=True 启动 + 轮询检查二进制
+checks:
+  - name: "verify.sh 阶段 1 展示了输入文件但未使用 whoami/id 权限检查"
+    on_fail: "删除 whoami/id/ls -l 等权限检查命令，只展示输入文件基本信息"
+  - name: "verify.sh 按三段式结构执行（阶段 1, 2, 3）"
+    on_fail: "确保 verify.sh 包含三个阶段标题"
+  - name: "exp.sh 提取结果写入了 /tmp/recovered_data"
+    on_fail: "确保 exp.sh 将恢复结果写入 /tmp/recovered_data"
+  - name: "verify.sh 最后一行输出 数据恢复验证完成"
+    on_fail: "删除末尾多余内容，确保最后输出 数据恢复验证完成"

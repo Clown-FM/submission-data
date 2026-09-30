@@ -1,0 +1,409 @@
+# CVE 复现 — 共用输出规范（所有类型生效）
+type: cve_base
+
+type_instruction: |
+  用户正在复现一个 CVE 漏洞。请优先使用 cve_lookup 获取漏洞详情，
+  然后搜索受影响的软件版本，搭建沙盒环境进行验证。
+  无论成功或失败，将所有输出文件保存到输出目录，
+  绝对不要调用 docker_cleanup 或 qemu_cleanup（容器/VM 必须保留）。
+
+  ## 🔴 脚本路径规则（最高优先级）
+
+  exp.sh 和 verify.sh 必须**同时存在于两个位置**：
+
+  1. **沙盒内**：
+     - Docker：写入 `/tmp/`（`docker exec <容器> bash /tmp/verify.sh`）
+     - QEMU：写入 `/opt/repro/`（`ssh ... bash /opt/repro/verify.sh`）
+     用 docker_run / qemu_run 配合 cat heredoc 写入，或 scp 复制。
+  2. **输出目录**：用 write_file 保存到宿主机输出目录。
+
+  ## 🔴 Shell 兼容性规则（Alpine 等基础镜像没有 bash）
+
+  exp.sh 和 verify.sh 的第一行（shebang）必须匹配容器的 shell：
+  - 如果容器是 **Alpine** 或未知迷你镜像 → 用 `#!/bin/sh`（没有 bash）
+  - 如果容器有 bash（ubuntu/debian/centos/python）→ 用 `#!/bin/bash`
+
+  判断方法：查看 Dockerfile 的基础镜像，或 `which bash` 检查。
+  如果拿不准，优先用 `#!/bin/sh`——sh 在所有容器中都有。
+  脚本中避免 bash-only 语法（source、[[ ]]、数组、string substitution）。
+
+  ❌ 禁止只写输出目录不写沙盒——用户无法在沙盒内执行。
+  ❌ 禁止只写沙盒不写输出目录——会话结束后文件丢失。
+  ❌ 禁止脚本写入后不 chmod——用户无法直接执行 `./verify.sh`。
+  ✅ 正确流程：先在沙盒内写入并 chmod +x，再 read_file 后用 write_file 保存到输出目录。
+  🔴 QEMU 后端特别注意：写入 `/opt/repro/` 后，必须用 `qemu_run` 将宿主机
+     输出目录中的 verify.sh 也复制到 VM 内（scp 或 cat heredoc），确保两端一致。
+  🔴 内核模块依赖：如果 exploit 需要特定内核模块（如 sch_skbprio、openvswitch），
+     exp.sh 开头必须先用 `modprobe <模块名>` 加载，不能假设模块已加载。
+
+  ## 聊天输出规则
+
+  复现结束时，Agent 必须在聊天中输出**简洁摘要（≤10 行）**，包含：
+  - 一句话结果（成功/部分成功/失败）
+  - 能力递进链各层状态
+  - 查看完整报告的命令（如 `cat output/.../report.md`）
+  - 运行验证的命令（如 `docker exec <容器> bash /tmp/verify.sh`）
+
+  ❌ 禁止把完整报告内容打印在聊天中——会造成截断。
+  ✅ 完整内容必须写入 report.md 和 README.md。
+
+execution_patterns: |
+  ## 🔴 容器内工作空间规则（所有 CVE 类型）
+
+  Agent 在容器内创建的所有文件必须放在工作空间目录 /tmp/<CVE-ID>/ 下。
+  /tmp/ 本身只放 exp.sh 和 verify.sh 两个入口文件。
+
+  原因：
+  - 多次尝试不会相互污染——每次 exp.sh 开头整个目录被覆盖
+  - cleanup 不需要维护文件名单——rm -rf 整个目录即可
+  - 与远程后端 /opt/repro/<CVE-ID>/ 命名一致
+
+  CVE_WORKDIR 由规范化引擎自动注入，exp.sh 不需要手动定义。
+
+  ## 🔴 编译命令执行规则
+
+  编译命令（go build / gcc / mvn）不要用 timeout 等结果。
+  改用后台启动 + 轮询检查二进制是否存在：
+
+  1. docker_run(cmd="go build > /tmp/build.log 2>&1 &", background=True)
+  2. 每 30s 检查: docker_run(cmd="ls /tmp/binary && tail -3 /tmp/build.log")
+  3. 二进制存在 → 成功；日志有 error 且二进制不存在 → 报编译失败
+  4. timeout 返回 exit=-1 时先检查二进制是否存在，存在即视为成功
+
+  ## 🔴 CVE_WORKDIR 使用规则
+
+  所有文件（编译产物、泄露数据、PoC、下载的存档）必须放在 CVE_WORKDIR 内。
+  只有 exp.sh 和 verify.sh 可以放在 /tmp/ 根目录。
+  脚本中引用文件时使用 $CVE_WORKDIR/xxx 而非 /tmp/xxx。
+
+  ## 🔴 docker_setup entrypoint_mode 选择规则（v2 新增）
+
+  docker_setup 工具的 entrypoint_mode 参数决定容器入口行为。根据 CVE 类型选择：
+
+  | 模式 | 行为 | 适用 CVE 类型 |
+  |------|------|--------------|
+  | `"sleep"`（默认） | 覆盖 CMD 为 `sleep 86400`，服务需手动启动 | LPE / 本地信息泄露 / 本地 DoS / 内核 exploit |
+  | `"cmd"` | 保留 Dockerfile CMD，服务自动启动 | RCE / 远程信息泄露 / XSS / 任意文件写入 / 远程 DoS / 认证绕过（远程） |
+  | `"both"` | 先启动 CMD（后台），再 sleep 保持可 exec | 需要同时跑服务 + 持续调试的场景 |
+
+  - Web 服务类 CVE：用 `entrypoint_mode="cmd"`，配合 `port_mappings` 暴露端口
+  - 本地二进制类 CVE：用默认 `"sleep"`，服务在 exp.sh 中手动启动
+  - 拿不准时用 `"sleep"`（最安全，不会因为 CMD 启动失败而丢容器）
+
+poc_script_spec: |
+  ## PoC 脚本通用规范
+
+  验证脚本的输出必须让非安全专业的用户也能一眼看懂。要求：
+
+  1. **屏蔽工具噪声**：重定向 stderr（2>/dev/null），或用 grep/sed 过滤，不要让触发命令的调试输出刷屏
+  2. **分阶段展示**：用清晰的标题分隔每个步骤：
+     ```
+     =====================================
+     CVE-XXXX-XXXXX 漏洞验证
+     =====================================
+     [1/3] 准备攻击环境...
+     [2/3] 触发漏洞...
+     [3/3] 检查结果...
+     ```
+  3. **明显的结果标记**：
+     - 成功：✅ 确认 — <一句话解释为什么>
+     - 失败：❌ 失败 — <可能原因>
+     - ⚠️ 部分成功 — <解释为什么效果有限，是 CVE 自身原因还是 Agent 未达预期>
+  4. **运行时关键信息**：关键命令的实际输出必须展示
+  5. **服务就绪检测**：exp.sh 负责启动目标服务（如 Web 服务、数据库等），
+     启动后用 sleep+curl 或类似方式等待就绪，再触发漏洞。
+     verify.sh 不再单独检测服务状态——直接调用 exp.sh 即可。
+     exp.sh 必须自包含：用户进容器后 `bash /tmp/exp.sh` 就能完成
+     服务启动 → 漏洞触发 → 数据收集的全流程。
+
+     ### 🔴 verify.sh 骨架自动启动机制
+
+     verify.sh 的 precondition 段已内置自动启动逻辑。如果 CVE 涉及 Web 服务，
+     你必须替换骨架中的 `__START_CMD__` 为实际的服务启动命令。替换后自动生效
+     （不替换则跳过，向后兼容）：
+
+     ```
+     # 示例：Node.js 服务
+     __START_CMD__ = "cd /opt/app && node index.js"
+
+     # 示例：Python Flask
+     __START_CMD__ = "cd /app && python app.py"
+
+     # 示例：PHP 内置服务器
+     __START_CMD__ = "php -S 0.0.0.0:8080 -t /var/www/html"
+     ```
+
+     自动启动逻辑仅在 precondition curl 检查失败时触发，服务已在运行时无害跳过。
+     这是对 docker_setup 使用 `--entrypoint sleep`（CMD 不会自动运行）的框架级补偿。
+  6. **CVE 影响说明**：verify.sh 结尾在 end_marker 之前，输出一段简短的影响说明。
+     如果是部分成功或失败，必须解释是 CVE 自身的限制还是复现环境问题:
+     ```
+     echo ""
+     echo "📋 影响说明: <1-2句话，说明此漏洞的实际影响范围>"
+     ```
+     例如: "此漏洞为线程级 OOM，JVM 自动恢复属正常行为，非 Agent 利用缺陷"
+  7. **🔴 DoS 专用 — 三段式验证 + 不可用证据要求**：
+     拒绝服务（DoS）验证必须按三段式执行，并且必须提供服务/系统不可用的硬证据。
+     仅有"漏洞路径走到"但系统仍然正常返回 HTTP 200 或进程仍存活时，判定为**失败**。
+
+     ```
+     ━━━ [阶段 1/3] 状态检查 — 攻击前 ━━━
+     展示服务/系统正常运行（HTTP 200、进程活跃、端口监听）
+
+     ━━━ [阶段 2/3] 触发 DoS ━━━
+     运行 bash /tmp/exp.sh
+
+     ━━━ [阶段 3/3] 状态检查 — 攻击后 ━━━
+     验证至少一项不可用证据：
+
+     ✅ 进程级: 目标进程消失（pgrep/ps 不再命中）
+     ✅ 网络级: curl 返回 000/timout、端口拒绝连接（QEMU/VM 场景）
+     ✅ 内核级: dmesg 含 panic 记录（KASAN/UAF 场景）
+     ✅ 资源级: 磁盘/file descriptor/内存完全耗尽（非部分占用）
+     ✅ Web/API 资源级: docker_stats 显示 CPU ≥95% 持续 10s+，或内存持续增长至限制的 80%+ 未回落
+     ✅ 并发探测级（NEW）: 攻击期间使用 docker_http_stress 或 verify.sh 内置并发探测，
+        显示 >50% 请求超时/失败，且延迟从基线 <100ms 升至 >5000ms
+
+     ❌ 如果系统/服务在攻击后仍恢复正常运行 → 失败
+     ❌ "漏洞代码路径走到了但没触发任何后果" → 失败，退化为信息泄露/PoC 级验证
+     ❌ 阶段 1 发现关键前置条件不满足（漏洞函数不存在、服务不可达、
+        API 版本不匹配等），直接判定为 ❌ 失败，不要走过场式验证。
+        stage 1 发现前置条件不满足时，后续阶段直接跳过。
+     ```
+     硬件/内核级 UAF 场景（无 KASAN）不即时崩溃是已知限制。Agent 必须在阶段 3
+     明确标注"KASAN 未启用，无法在攻击后验证即时崩溃"，然后如实判断是否通过。
+
+  8. **🔴 DoS 并发探测模式（新增 — 适用于非崩溃型 DoS）**：
+     对于 ReDoS、CPU 耗尽型、连接耗尽型等**不杀死进程**的 DoS，必须使用
+     并发探测模式而非攻击后单次检查：
+
+     ```
+     ━━━ [阶段 2/3] 触发 DoS + 并发健康探测 ━━━
+     攻击在后台启动（exp.sh &）
+     同时启动 N 个并发线程持续发送健康检查请求
+
+     攻击结束时:
+       ━━━ 并发探测结果 ━━━
+       总请求: 45 | 成功: 3 | 失败: 12 | 超时: 30
+       基线延迟: 12ms → 攻击期间延迟: 3500ms (p95)
+       ✅ 不可用判定: 请求失败率 93%
+     ```
+
+     框架在 execute_verify() 中自动替换 `__DOS_WINDOW__` 占位符为攻击窗口秒数，
+     并自动解析 /tmp/dos_checker.json 的并发探测结果。
+     旧 verify.sh 无并发探测结果的，框架 fallback 到旧模式（HTTP 200 恢复检测）。
+
+  9. **🔴 证据契约规则：exp.sh → verify.sh 数据链路**
+
+     exp.sh 和 verify.sh 必须通过**共享证据文件**通信，不能 verify.sh 独立重复调用 API
+     （重复调用可能因状态变化导致结果不一致），也不能 grep exp.sh 的输出（循环验证）。
+
+     证据路径: `/tmp/.cve_evidence.json`
+     写入方: exp.sh 在触发漏洞后，将**原始未经处理的 API 响应/系统输出**写入此文件
+     读取方: verify.sh 独立读取此文件，做自己的判断
+
+     ```
+     # exp.sh 中写入（Node.js 示例）
+     fs.writeFileSync('/tmp/.cve_evidence.json', JSON.stringify({ checklists: rawData }));
+
+     # exp.sh 中写入（bash 示例）
+     curl -s http://localhost:8080/api/data > /tmp/.cve_evidence.json
+
+     # verify.sh 中读取
+     node -e "var d=require('/tmp/.cve_evidence.json'); ...独立判断..."
+     ```
+
+     **规则：**
+     - ✅ exp.sh 必须写入 `/tmp/.cve_evidence.json`
+     - ✅ verify.sh 读取该文件做独立判定
+     - ❌ 禁止 verify.sh grep exp.sh 的 stdout（循环验证）
+     - ❌ 禁止 verify.sh 独立调同样的 API（状态可能变）
+
+  ### 🔴 end_marker 硬性规则（最后一行必须严格等于）
+
+  | 漏洞类型 | verify.sh 最后一行 | exp.sh 最后一行 |
+  |---------|-------------------|----------------|
+  | 本地提权 (LPE) | `[ -t 1 ] && exec /tmp/rootshell -p` / `exec sudo -i` | `EXP 完成` |
+  | 本地信息泄露 | `本地信息泄露验证完成` | `泄露数据已收集` |
+  | 远程信息泄露 | `远程信息泄露验证完成` | `泄露数据已收集` |
+  | 远程代码执行 (RCE) | `exec ncat $VICTIM 4444` | `deploy_bind.sh 已就绪` |
+  | 本地认证绕过 | `本地认证绕过验证完成` | `EXP 完成` |
+  | 远程认证绕过 | `远程认证绕过验证完成` | `EXP 完成` |
+  | 本地授权绕过 | `本地授权控制验证完成` | `EXP 完成` |
+  | 远程授权绕过 | `远程授权控制验证完成` | `EXP 完成` |
+  | 安全功能绕过 | `echo '安全功能绕过验证完成'` | `EXP 完成` |
+  | 跨站脚本（XSS） | `echo 'XSS 验证完成'` | `EXP 完成` |
+  | 任意文件写入 | `echo '任意文件写验证完成'` | `EXP 完成` |
+  | 本地拒绝服务 (DoS) | `echo '本地拒绝服务验证完成'` | `EXP 完成` |
+  | 远程拒绝服务 (DoS) | `echo '远程拒绝服务验证完成'` | `EXP 完成` |
+  | 离线数据恢复 | `数据恢复验证完成` | `数据恢复验证完成` |
+  | 基本复现 (PoC) | 展示 PoC 关键输出 | `EXP 完成` |
+
+  ❌ **禁止事项（无例外）：**
+  - 禁止用 `echo` 替代 `exec`（如 `echo "LPE verified! Run: /tmp/rootshell -p"` 不等于 `exec /tmp/rootshell -p`）
+  - 禁止在 end_marker 后追加任何行（exit、echo、空行、`=====` 装饰线等）
+  - 禁止用 `echo "验证完成"` 或 `echo "EXP 完成"` 代替实际验证逻辑
+  - 🔴 exp.sh 和 verify.sh 最后一行必须用 echo 输出 end_marker（裸文本会被 bash 当作命令执行）。
+    例外：script -qc /tmp/rootshell -p（LPE 有提示符）和 exec ncat（RCE）结尾本身就是命令，不需要 echo 包装。
+  - 🔴 **exp.sh 和 verify.sh 不得包含安装命令**（apt-get install / pip install / npm install 等）。
+    所有依赖（编译工具、库、Python 包）必须在 Dockerfile 中提前装好，或在 docker_setup 时由基础设施安装。
+    脚本只负责触发漏洞和验证结果，不负责装环境。
+  - 写完后必须 self-check：read_file 读回脚本，确认最后一行严格等于 end_marker
+  - 🔴 即使复现失败也必须输出 README.md（含失败原因和排查建议），不能跳过
+
+  ### 🔴 verify.sh header 格式规则
+
+  verify.sh 开头必须按以下格式输出 CVE ID 和漏洞类型，{CVE_ID} 和 {TYPE} 按映射表替换：
+
+  ```
+  ============================================
+    {CVE_ID} — {TYPE}验证
+  ============================================
+  ```
+
+  类型映射表（agent 必须使用，不能自己编文字）：
+
+  | target_level | TYPE |
+  |---|---|
+  | remote_information_disclosure | 远程信息泄露 |
+  | local_information_disclosure | 本地信息泄露 |
+  | remote_authentication_bypass | 远程认证绕过 |
+  | local_authentication_bypass | 本地认证绕过 |
+  | remote_authorization_bypass | 远程授权绕过 |
+  | local_authorization_bypass | 本地授权绕过 |
+  | security_feature_bypass | 安全功能绕过 |
+  | local_privilege_escalation | 本地提权 |
+  | remote_code_execution | 远程代码执行 |
+  | remote_denial_of_service | 远程拒绝服务 |
+  | local_denial_of_service | 本地拒绝服务 |
+  | xss | 跨站脚本（XSS） |
+  | arbitrary_file_write | 任意文件写入 |
+  | offline_data_recovery | 离线数据恢复 |
+  | other | 基本复现 |
+
+  示例：
+  ```
+  ============================================
+    CVE-2024-55660 — 远程信息泄露验证
+  ============================================
+  ```
+
+  ## 🔴 verify.sh 输出规范
+
+  verify.sh 是给用户直接运行的命令，不是调试报告。必须遵守：
+
+  1. **同一结论不重复**——每个阶段只输出一次 ✅/❌，不要在一个阶段内套多层子标题
+  2. **技术分析细节（反汇编、源码对比、版本推导过程）归入 report.md**，不塞进 verify.sh
+  3. **日志和调试输出用 2>/dev/null 过滤**，不在终端显示
+  4. **用户只关心：漏洞存在吗？触发了没？怎么解决？** 其他内容砍掉
+
+  report.md 才是完整分析报告，不限篇幅、不限细节。
+
+cve_mechanism_guide: |
+  ## CVE 利用机制适配指南
+
+  以上是通用结构和验收标准。具体的利用机制由 Agent 通过 **cve_lookup** 获取漏洞详情后确定，包括：
+
+  | 项目 | 说明 | 示例 |
+  |------|------|------|
+  | **触发命令** | 需要利用的入口程序 | needrestart / pkexec / insmod / sudoedit / 自定义 setuid 程序 |
+  | **利用方式** | 如何让目标进程执行攻击者代码 | PYTHONPATH 注入 / LD_PRELOAD / 竞态条件 / ptrace 注入 / 内核模块加载 |
+  | **噪声过滤** | 触发命令特有的调试输出，需用 grep/sed 屏蔽 | needrestart 的 "Failed to"；pkexec 的 "Error executing command" |
+  | **持久化进程** | 保持利用状态的方式（如某些 CVE 不需要） | 后台进程 / 文件锁 / inotify 监听 |
+
+  **脚本通用编写规则：**
+  - 具体触发命令和利用方式根据 cve_lookup 结果自行确定，不要硬编码
+  - 噪声过滤模式根据触发命令的实际输出调整，目标是让用户看到干净的结果
+  - 🔴 exppilot-attacker 容器仅限 RCE 类型使用。非 RCE 类型禁止依赖 exppilot-attacker，
+    如需后台进程（恶意服务端等），在目标容器内用 & 或 nohup 直接启动
+
+# 共用文件定义
+files:
+  - name: Dockerfile
+    desc: "环境重现"
+    category: env
+    rules:
+      - "从 FROM 开始，记录所有 apt-get install、pip install、git clone、版本降级等关键操作"
+      - "Agent 探索过程的试错不必写入，但关键依赖必须覆盖"
+      - "不需要 CMD/ENTRYPOINT"
+
+  - name: simulate.sh
+    desc: "软件模拟硬件触发条件（替代 exp.sh，当物理硬件不可用时）"
+    category: optional
+    rules:
+      - "当漏洞触发需要物理硬件/设备但当前环境无对应硬件时，写 simulate.sh"
+      - "simulate.sh 通过软件方式直接调用漏洞代码路径，不依赖特定硬件"
+      - "exp.sh 保留给有物理硬件的用户，simulate.sh 是备选方案"
+
+  - name: README.md
+    desc: "用户手册"
+    category: doc
+    rules:
+      - "包含 5 个章节：快速验证、手动分步验证、漏洞原理、关键文件、排查技巧"
+
+  - name: report.md + status.json
+    desc: "报告和状态"
+    category: meta
+    rules:
+      - "按 agent.yaml 要求输出"
+
+readme_chapters:
+  - name: "快速验证"
+    desc: |
+      🔴 快速验证必须是**一条命令**，用户在宿主机直接复制执行，不能分多步。
+      🔴 默认格式: `docker exec <容器> bash /tmp/verify.sh`
+        需要 `-u attacker` 或 `-it` 的类型会单独覆盖。
+      🔴 QEMU 后端格式:
+        `ssh -p <port> -i ~/.exppilot/ssh/exppilot_vm ubuntu@localhost 'bash /opt/repro/verify.sh'`
+      🔴 必须附带预期输出的**最后 3-5 行**（含 end_marker 和 ✅/❌ 标记）。
+         预期输出必须是实际运行结果的截取，不能编造。
+      🔴 禁止跨容器验证——verify.sh 必须在单一容器内完成。
+         即使 exp.sh 使用双容器（RCE），快速验证仍应只用一个命令。
+  - name: "手动分步验证"
+    desc: |
+      ≥5 步，每步必须是完整的 shell 命令。每步附带预期输出。
+      🔴 **所有命令输出必须清理**：去掉调试日志、堆地址、十六进制 dump、内部进度条。
+         只保留对用户有意义的行：✅ 确认 / ❌ 失败 / 关键返回值。
+         例如：原始输出 `[0x7fffabc123] heap dump: 41 42 43...` → 改为 `✅ 堆内存已被修改`。
+      🔴 如果原始输出过长（>20 行），用"...省略 X 行..."折叠，只展示头尾关键行。
+  - name: "漏洞原理"
+    desc: "通俗解释 + ASCII 流程图 + 漏洞代码位置。面向普通用户，不要写内核代码细节。"
+  - name: "关键文件"
+    desc: "表格列出文件、属主、用途"
+  - name: "排查技巧"
+    desc: "≥3 条诊断命令"
+
+# 共用自检（所有类型生效）
+checks:
+  - name: "🔴 Docker 后端必须含 Dockerfile，QEMU 后端必须含 QEMU_INFO.md"
+    on_fail: "Docker: 补写 Dockerfile；QEMU: 补写 QEMU_INFO.md（含镜像名、内核版本、SSH 端口）"
+  - name: "🔴 exp.sh 和 verify.sh 必须同时存在于宿主机输出目录和沙盒内"
+    on_fail: "用 qemu_run（QEMU）或 docker cp（Docker）将脚本复制到沙盒，确保双端一致"
+  - name: "README 包含全部 5 个章节（快速验证、手动分步 ≥5 步、原理含流程图、关键文件表格、排查 ≥3 条）。🔴 即使复现失败也必须输出 README.md"
+    on_fail: "用 write_file 补充缺失章节。失败时 README 也必须有失败原因和排查建议"
+  - name: "README 手动分步章节的预期输出已清理——去掉了调试日志、堆地址、十六进制 dump"
+    on_fail: "逐条检查每步的预期输出：如果包含十六进制 dump / 堆地址 / [*] 调试日志，用 write_file 替换为清理后的摘要（如 ✅ 堆内存已被修改 替换具体的 hex dump）"
+  - name: "exp.sh 和 verify.sh 分离（攻击逻辑和验证逻辑不在同一文件中）"
+    on_fail: "拆分为 exp.sh（攻击）和 verify.sh（验证）"
+  - name: "exp.sh 最后一行用 echo 输出了 end_marker（非裸文本，裸文本会被 bash 当命令执行）"
+    on_fail: "将 exp.sh 末尾的裸文本改为 echo 包装（如 EXP 完成 → echo 'EXP 完成'）"
+  - name: "verify.sh 最后一行用 echo 输出了 end_marker（非裸文本，裸文本会被 bash 当命令执行）"
+    on_fail: "将 verify.sh 末尾的裸文本改为 echo 包装"
+  - name: "verify.sh 运行了 bash /tmp/exp.sh（exp.sh 通过 env.sh 启动服务后触发漏洞）"
+    on_fail: "在 verify.sh 开头加 bash /tmp/exp.sh 调用"
+  - name: "exp.sh 在触发漏洞前启动了目标服务/环境并等待就绪（sleep+验证）"
+    on_fail: "在 exp.sh 触发逻辑前加服务启动+就绪等待"
+  - name: "verify.sh 在 end_marker 前输出了 📋 影响说明（CVE 自身的限制或复现环境约束）"
+    on_fail: "在 end_marker 之前加 echo 输出 CVE 影响说明"
+  - name: "🔴 如果阶段 1 检测到关键前置条件不满足（漏洞函数不存在、服务不可达等），verify.sh 应整体判定❌失败而非✅成功走过场"
+    on_fail: "重写 verify.sh：前置条件不满足时直接 exit 1，不要在阶段 2/3 做无意义的验证"
+  - name: "🔴 涉及修改 PoC 源码时，必须优先使用 read_file+write_file 或 sed，禁止使用 patch 工具"
+    on_fail: "删除对 patch 工具的调用，改用 read_file 读取后直接在推理中修改再 write_file 覆盖"
+  - name: "🔴 RCE 类型必须存在受害者容器和 exppilot-attacker 两个容器"
+    on_fail: "RCE 必须双容器架构，创建受害者容器后重新运行"
+  - name: "🔴 RCE 类型攻击者容器内 verify.sh 路径必须使用纯 CVE ID，不能带 -Docker/-Qemu 后缀"
+    on_fail: "重新 docker cp，目标路径改为 /tmp/<纯CVE-ID>/verify.sh"
+  - name: "🔴 exp.sh 开头必须清理 CVE_WORKDIR 工作空间（由规范化引擎自动注入），防止残留数据导致假阳性"
+    on_fail: "确认 CVE_WORKDIR 在脚本头部定义，并执行 rm -rf \"$CVE_WORKDIR\""
+  - name: "🔴 编译命令（go build/gcc/mvn）必须用后台启动 + 轮询检查二进制，禁止用 timeout 等结果"
+    on_fail: "将编译命令改为 background=True 启动，然后每 30s 检查二进制文件是否存在"

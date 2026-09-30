@@ -1,0 +1,217 @@
+# CVE 复现 — 本地拒绝服务（OS 层屏障：内核崩溃、本地资源耗尽）
+target_type: local_denial_of_service
+label: "本地拒绝服务"
+attack_surface: local
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "sleep"
+  requires_startup: false
+
+type_instruction: |
+  【拒绝服务模式】用户选择 DoS 目标。目标是证明可导致目标服务
+  不可用或系统崩溃。验收标准：目标服务不可用。
+
+acceptance: |
+  ## DoS 漏洞验收标准
+
+  DoS 漏洞复现必须达到：**攻击者导致目标服务不可用或系统崩溃**。
+
+  **通用步骤：**
+  1. 搭建受影响版本的目标服务
+  2. 触发漏洞（发送恶意数据包/请求）
+  3. 检测服务状态变化（不可用/崩溃）
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 漏洞利用（触发 DoS）
+    负责触发漏洞并检测服务状态。
+  sections:
+    - title: "通用规则"
+      rules:
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "输出以 EXP 完成 结尾"
+        - "触发前检查服务状态，触发后再次检查"
+        - "展示服务前后状态对比"
+        - "如需内核参数（panic_on_oops、mmap_min_addr 等）才能触发，exp.sh 开头必须自动设置，因为重启后会自动恢复"
+        - "🔴 本地资源耗尽型 DoS（fork bomb、fd 耗尽、磁盘写满）：进程可能不死亡，建议用并发模式（攻击后台 &，攻击期间持续检查系统可用性）"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本（三段式）
+    三段式验证：攻击前状态 → 触发 DoS → 攻击后不可用证明。
+    🔴 必须有不可用的硬证据才能判定通过。
+  sections:
+    - title: "阶段 1 — 攻击前状态"
+      text: |
+        记录攻击前的正常状态（进程/端口/HTTP 均可）：
+      code: |
+        echo "============================================"
+        echo "  CVE-XXXX-XXXXX <漏洞名> DoS 验证"
+        echo "============================================"
+        echo ""
+        echo "━━━ [阶段 1/3] 攻击前状态 ━━━"
+        # Agent 根据实际目标填写检查命令
+        echo "  ✅ 攻击前: <进程名>/端口正常"
+    - title: "阶段 2 — 触发 DoS"
+      text: |
+        运行 exp.sh 触发漏洞：
+      code: |
+        echo ""
+        echo "━━━ [阶段 2/3] 触发 DoS ━━━"
+        bash /tmp/exp.sh
+        echo ""
+    - title: "阶段 3 — 不可用验证"
+      text: |
+        检查系统/服务是否真正不可用。如果没有不可用证据则判定为失败：
+      code: |
+        echo "━━━ [阶段 3/3] 不可用验证 ━━━"
+        # Agent 根据实际目标选择至少一种不可用证据
+        # 可选: 进程消失 / 端口拒绝 / dmesg panic / 资源耗尽
+        #
+        # 如果确认不可用:
+        #   echo "✅ 失败 — 系统/服务不再响应"
+        #   echo '本地拒绝服务验证完成'
+        #
+        # 如果无不可用证据:
+        #   echo "❌ 失败 — 系统/服务仍然正常"
+        #   echo "   原因: <explain>"
+        echo ""
+        echo "📋 影响说明: CVE 限制/环境说明（Agent 填写）"
+        echo '本地拒绝服务验证完成'
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+
+    # 自动启动（Agent 替换 __START_CMD__ 后生效，未替换则跳过）
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ 运行 exp.sh ━━━"
+    bash /tmp/exp.sh
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if ! curl -sf --max-time 5 __TARGET_URL__ > /dev/null 2>&1; then
+        echo "✅ 系统/服务不可用 — DoS 成功"
+    else
+        echo "❌ 系统/服务仍然可用"
+        exit 1
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    echo "验证完成"
+
+  end_marker: "echo '本地拒绝服务验证完成'"
+
+files:
+  - name: exp.sh
+    desc: "漏洞利用（触发 DoS）"
+    category: exploit
+    end_marker: "EXP 完成"
+    rules:
+      - "不使用 set -e"
+      - "触发前检查服务状态，触发后再次检查——展示前后对比"
+      - "输出以 EXP 完成 结尾"
+
+  - name: verify.sh
+    desc: "验证脚本（三段式）"
+    category: verify
+    end_marker: "echo '本地拒绝服务验证完成'"
+    rules:
+      - "三段式：阶段 1 攻击前状态 → 阶段 2 触发 DoS → 阶段 3 不可用验证"
+      - "阶段 1 展示攻击前正常状态"
+      - "阶段 2 运行 bash /tmp/exp.sh"
+      - "🔴 阶段 3 必须有不可用硬证据。仅「漏洞路径走到」但无崩溃 → 判定失败"
+      - "用 ✅/❌ 标记验证结果"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: local_denial_of_service。写入前必须确认：
+
+      1. 三段式：阶段 1 攻击前状态 → 阶段 2 触发 DoS → 阶段 3 不可用验证
+      2. 🔴 阶段 1 如果检测到前置条件不满足（模块缺失、工具/依赖未安装等），
+         先尝试加载/安装（modprobe/apt-get），不要直接 exit 1
+      3. 🔴 阶段 3 必须有不可用硬证据（进程消失/panic/资源耗尽）
+      4. 如果无不可用证据 → 判定❌失败而非✅成功
+      5. 不使用 set -e
+      6. 最后一行严格等于 echo '本地拒绝服务验证完成'
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否有三个阶段标题（阶段 1/3 / 阶段 2/3 / 阶段 3/3）？□
+         → 如果缺少 → 用 write_file 重写
+      2. 阶段 3 是否检查了不可用证据（进程/端口/dmesg/resource）？□
+         → 如果没有 → 用 write_file 重写
+      3. 是否有 ✅/❌ 标记？□
+         → 如果没有 → 用 write_file 重写
+      4. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      5. 最后一行是否严格等于 echo '本地拒绝服务验证完成'？□
+         → 如果不是 → 删除末尾多余行，用 write_file 重写
+      6. 🔴 阶段 1 检测到前置条件不满足时，是否先尝试修复（modprobe/apt-get）
+         而不是直接 exit 1？□
+         → 如果是直接 exit 1 → 改为先尝试加载/安装，用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: local_denial_of_service。写入前必须确认：
+
+      1. 不使用 set -e，清理命令加 2>/dev/null || true
+      2. 如果 exploit 需要内核模块（如 sch_skbprio），开头必须用 modprobe 加载
+      3. 触发前检查服务状态，触发后再次检查——展示前后对比
+      4. 最后一行输出严格等于 EXP 完成
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      2. 最后一行是否严格等于 EXP 完成？□
+         → 如果不是 → 用 write_file 重写
+         → 如果是裸文本 EXP 完成 而非 echo "EXP 完成" → 改为 echo 包装，用 write_file 重写
+      3. 是否展示了服务状态前后对比？□
+         → 如果没有 → 用 write_file 重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+      10. exp.sh 开头是否清理了 CVE_WORKDIR 工作空间？□
+         → 如果没有 → 在开头加 rm -rf "$CVE_WORKDIR" && mkdir -p "$CVE_WORKDIR"，用 write_file 重写
+      11. 如果 exp.sh 包含编译命令（go build/gcc/mvn），是否用 background=True 启动而非 timeout 等待？□
+         → 如果是同步编译 → 改为 background=True 启动 + 轮询检查二进制
+checks:
+  - name: "exp.sh 成功触发 DoS 并展示了服务状态变化，最后一行是 EXP 完成"
+    on_fail: "ensure exp.sh 展示服务前后状态对比，最后一行严格等于 EXP 完成"
+  - name: "verify.sh 按三段式结构执行（阶段 1/3, 2/3, 3/3），阶段 3 检查了不可用证据"
+    on_fail: "确保 verify.sh 有三段式标题，阶段 3 包含不可用证据检查（进程/dmesg/资源）"
+  - name: "verify.sh 最后一行严格等于 echo '本地拒绝服务验证完成'"
+    on_fail: "删除末尾多余 exit/echo/空行"

@@ -1,0 +1,368 @@
+# CVE 复现 — 远程拒绝服务（应用层屏障：网络协议、服务端口）
+target_type: remote_denial_of_service
+label: "远程拒绝服务"
+attack_surface: remote
+
+# 容器运行时配置（框架读取，不依赖 agent）
+container:
+  entrypoint_mode: "cmd"
+  requires_startup: true
+
+# verify.sh 自启动配置
+startup:
+  port: 8080
+  health: "/"
+  cmd: ""
+
+type_instruction: |
+  【远程拒绝服务模式】用户选择远程 DoS 目标。证明远程攻击者可通过
+  网络请求使目标服务不可用或崩溃。屏障在网络协议层，不在 OS 层。
+  验收标准：目标服务不可用。
+
+  🔴 此 CVE 类型涉及 Web/网络服务，使用 docker_setup 时请传 entrypoint_mode="cmd"（保留 Dockerfile CMD 自动启动服务），
+  并视需要传 port_mappings 暴露端口（如 port_mappings=["3001:3001"]）。
+
+  ### 🔴 DoS 子类型识别（影响后续所有策略选择）
+  在写 exp.sh/verify.sh 前，先分析 CVE 描述确定子类型：
+  - **进程崩溃型**（crash/NULL ptr/panic）→ 顺序模式，单次请求即可
+  - **ReDoS**（正则回溯）→ 并发模式，单条 payload 即可
+  - **CPU 耗尽型（数据库 LIKE）** → 并发模式，**需要持续攻击负载** + 数据注入
+  - **连接耗尽型**（worker/连接池）→ 并发模式，**需要持续攻击负载**
+  - **内存泄漏型** → 并发模式，可能需要持续负载
+
+  详细分类指引见 strategies/remote_dos.md。
+
+acceptance: |
+  ## 远程 DoS 漏洞验收标准
+
+  远程 DoS 漏洞复现必须达到：**远程攻击者通过网络请求导致目标
+  服务不可用或崩溃**。
+
+  ### 不可用判定矩阵（按 DoS 子类型）
+
+  | 子类型 | 可接受证据 | 不可接受证据 |
+  |--------|-----------|-------------|
+  | **进程崩溃型**（crash） | 进程消失 / 端口拒绝 / HTTP 000 | 仅 HTTP 200 但无崩溃证据 |
+  | **资源耗尽型**（CPU 100%） | docker_stats CPU ≥ 95% 持续 10s+ | 仅说 "CPU 很高" 无量化数据 |
+  | **内存泄漏型**（memory leak） | 内存持续增长至限制 80%+ 未回落，或 OOM killer | 短暂 spike 后回落 |
+  | **ReDoS**（regex DoS） | **攻击期间并发探测 > 50% 请求超时/失败**，且延迟从基线 <100ms 升至 >5000ms | 仅攻击后单次 curl 200（此时已恢复） |
+  | **连接耗尽型**（conn pool） | 新连接被拒绝 / PIDs 接近限制 | 已有连接仍可通信 |
+
+  ⚠️ **ReDoS 特别说明**：正则回溯结束后事件循环自动恢复，服务进程不死亡。
+  因此攻击后单次 `curl 200` 不能证明服务可用性——必须用**攻击期间并发探测**
+  证据证明窗口期不可用。
+
+  ### 验证模式选择
+
+  - **顺序模式**（默认）：攻击 → 后检查。适用：进程崩溃型、OOM
+  - **并发模式**（新增）：攻击后台跑 + 期间健康探测。适用：ReDoS、CPU 耗尽、连接耗尽、内存泄漏
+
+  **二段式验证（verify.sh 必须按此顺序执行）：**
+
+  ### 阶段 1：服务存活证明
+  展示目标服务正常运行（端口监听、HTTP 200、进程存活）。
+  🔴 不要用 whoami/id——没有意义。
+
+  ### 阶段 2：触发 DoS + 状态检测
+  运行 exp.sh 发送恶意请求，检测服务是否不可用。
+
+exp_sh:
+  header: |
+    ### 1. exp.sh — 漏洞利用（触发远程 DoS）
+    负责触发漏洞并检测服务状态。
+  sections:
+    - title: "通用规则"
+      rules:
+        - "不使用 set -e，清理命令加 2>/dev/null || true"
+        - "输出以 EXP 完成 结尾"
+        - "触发前检查服务状态，触发后再次检查"
+        - "展示服务前后状态对比"
+        - "🔴 Web/API DoS：触发前用 docker_stats 记录 baseline，触发中每 5-10s 采样监控，触发后对比确认 CPU/MEM/PIDs"
+
+    - title: "⚠️ 并发模式专用规则（持续负载型 DoS）"
+      condition: "仅当 DoS 子类型为 CPU 耗尽型/连接耗尽型/内存泄漏型时适用"
+      rules:
+        - "exp.sh 必须生成持续攻击负载，不只发几条请求就退出"
+        - "攻击持续时间至少 15-30 秒，留足探测窗口"
+        - "如果写了 /tmp/attacker.py，exp.sh 必须在攻击阶段调用它，而不是让 verify.sh 直接调"
+        - "如果是数据库查询型 DoS（LIKE %...%），先检查数据量，不足则注入 seed data"
+        - "超时处理：如果攻击耗时长，用 & 后台运行 + wait，不要删攻击逻辑来缩短时间"
+
+verify_sh:
+  header: |
+    ### 2. verify.sh — 一键验证脚本（三段式）
+    三段式：攻击前服务状态 → exp.sh 启动+触发 → 攻击后不可用验证。
+    🔴 必须有不可用的硬证据才能判定通过。
+  sections:
+    - title: "阶段 1 — 攻击前服务状态"
+      text: |
+        记录攻击前的正常服务状态：
+      code: |
+        echo "============================================"
+        echo "  CVE-XXXX-XXXXX <漏洞名> 远程 DoS 验证"
+        echo "============================================"
+        echo ""
+        echo "━━━ [阶段 1/3] 攻击前服务状态 ━━━"
+        # Agent 根据实际服务填写
+        curl -s -o /dev/null -w "  攻击前: HTTP %{http_code}\n" "<目标URL>"
+        echo "  ✅ 服务正常运行"
+    - title: "阶段 2 — 触发 DoS"
+      text: |
+        env.sh 负责启动服务，exp.sh 负责触发漏洞，验证脚本直接调用 exp.sh：
+      code: |
+        echo ""
+        echo "━━━ [阶段 2/3] 触发 DoS ━━━"
+        bash /tmp/exp.sh
+        echo ""
+    - title: "阶段 3 — 不可用验证"
+      text: |
+        检查服务是否真正不可用（HTTP 000/timeout/端口拒绝/进程消失）。
+        如果没有不可用证据则判定为失败。
+
+        🔴 Web/API DoS 场景：HTTP 200 不代表服务正常。必须同时检查
+        docker_stats 输出的资源指标：
+        - CPU ≥ 95% 持续 10s+ → 资源耗尽型 DoS
+        - 内存使用持续增长 → 内存泄漏型 DoS
+        - PIDs 接近限制 → 连接池/进程耗尽
+      code: |
+        echo "━━━ [阶段 3/3] 不可用验证 ━━━"
+        # Agent 选择至少一种不可用证据检查
+        # 可选: curl timeout / 端口拒绝 / 进程消失
+        #
+        # 如果确认不可用:
+        #   echo "✅ 服务不可用 — 攻击成功"
+        #   echo '远程拒绝服务验证完成'
+        #
+        # 如果无不可用证据:
+        #   echo "❌ 失败 — 服务仍然正常"
+        #   echo "   原因: <explain>"
+        echo ""
+        echo "📋 影响说明: CVE 限制/环境说明（Agent 填写）"
+        echo '远程拒绝服务验证完成'
+  skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+
+    # 自动启动（Agent 替换 __START_CMD__ 后生效，未替换则跳过）
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: exec_exp]
+    echo "━━━ 运行 exp.sh ━━━"
+    bash /tmp/exp.sh
+    echo ""
+
+    # [COMPLIANCE CHECK: evidence_check]
+    if ! curl -sf --max-time 5 __TARGET_URL__ > /dev/null 2>&1; then
+        echo "✅ 服务不可用 — DoS 成功"
+    else
+        echo "❌ 服务仍然可用"
+        exit 1
+    fi
+    echo ""
+
+    # [COMPLIANCE CHECK: end_marker]
+    echo "验证完成"
+
+  end_marker: "echo '远程拒绝服务验证完成'"
+
+  # 并发模式骨架（供 Agent 选择使用，替代上方的顺序 skeleton）
+  # 用于 ReDoS/CPU 耗尽/内存泄漏等不杀进程的 DoS 类型。
+  # 注意：Python 多行代码在 YAML | 块中会因列 0 缩进而断块，
+  # 因此实际 Python 代码由 Agent 在写入 verify.sh 时填充。
+  # __DOS_WINDOW__ 由框架在 execute_verify() 中自动替换为攻击窗口秒数。
+  concurrent_skeleton: |
+    #!/bin/sh
+
+    # [COMPLIANCE CHECK: precondition]
+    echo "━━━ [前置检查] 服务可用性 ━━━"
+    if ! curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+        if [ "__START_CMD__" != "__START_CMD__" ]; then
+            echo "  ⚠️ 服务未运行，正在自动启动..."
+            nohup sh -c "__START_CMD__" > /tmp/server.log 2>&1 &
+            sleep 5
+        fi
+    fi
+    for i in $(seq 1 15); do
+        if curl -sf http://127.0.0.1:__PORT__/__HEALTH__ > /dev/null 2>&1; then
+            echo "  ✅ 服务就绪"
+            break
+        fi
+        sleep 2
+        [ "$i" -eq 15 ] && echo "  ❌ 服务不可达" && exit 1
+    done
+    echo ""
+
+    # [COMPLIANCE CHECK: concurrent_dos]
+    echo "━━━ [并发 DoS 验证] 后台攻击 + 健康探测 ━━━"
+
+    # 1. 基线测量（单请求延迟）
+    echo "--- 基线测量 ---"
+    BASELINE_MS=$(python3 -c "import urllib.request,time;t0=time.time();urllib.request.urlopen('http://127.0.0.1:__PORT__/__HEALTH__',timeout=5);print(f'{(time.time()-t0)*1000:.0f}')" 2>/dev/null || echo "FAILED")
+    echo "  基线延迟: ${BASELINE_MS}ms"
+
+    # 2. 攻击后台启动
+    echo "--- 启动攻击（后台运行）---"
+    bash /tmp/exp.sh &
+    ATTACK_PID=$!
+
+    # 3. 攻击期间并发健康探测（__DOS_WINDOW__ 由框架自动替换）
+    echo "--- 攻击期间并发探测（窗口: __DOS_WINDOW__s）---"
+    # 🔴 Agent: 在此写入 python3 并发探测代码
+    #  - 用 urllib + threading（stdlib，不需要额外包）
+    #  - 持续发请求直到超时窗口
+    #  - 结果写入 /tmp/dos_checker.json
+    #    格式: {"total":N, "ok":N, "fail":N, "timeout":N, "unavailable":bool}
+    #  - 也可用 docker_http_stress 工具（如果容器外）
+    # 参考实现（Agent 在写入 verify.sh 时替换占位符）:
+    #   python3 << 'PYEOF'
+    #   import json,time,threading,urllib.request,urllib.error,socket
+    #   R={"total":0,"ok":0,"fail":0,"timeout":0};W=__DOS_WINDOW__;LIM=time.time()+W;LK=threading.Lock()
+    #   def p():
+    #    while time.time()<LIM:
+    #     try:r=urllib.request.urlopen("http://127.0.0.1:__PORT__/__HEALTH__",timeout=5);LK: R["ok"]+=1
+    #     except (urllib.error.URLError,socket.timeout,OSError):LK: R["timeout"]+=1
+    #     finally:LK: R["total"]+=1
+    #     time.sleep(0.3)
+    #   tt=[threading.Thread(target=p) for _ in range(3)]
+    #   for t in tt:t.start()
+    #   for t in tt:t.join()
+    #   R["unavailable"]=R["ok"]/max(R["total"],1)<0.5
+    #   json.dump(R,open("/tmp/dos_checker.json","w"))
+    #   PYEOF
+    echo "  (探测完成)"
+
+    # 4. 等待攻击完成
+    wait $ATTACK_PID 2>/dev/null || true
+
+    # [COMPLIANCE CHECK: evidence_check]
+    echo ""
+    echo "━━━ [不可用验证] ━━━"
+    python3 -c "import json;d=json.load(open('/tmp/dos_checker.json'));print(f'  总探测: {d[\"total\"]} | 成功: {d[\"ok\"]} | 失败: {d[\"fail\"]} | 超时: {d[\"timeout\"]}')"
+    python3 -c "import json;exit(0 if json.load(open('/tmp/dos_checker.json')).get('unavailable') else 1)" && echo "  ✅ 服务不可用 — DoS 通过" || { echo "  ❌ 服务仍可用 — DoS 失败"; exit 1; }
+    echo ""
+    echo "📋 影响说明: __DOS_IMPACT__"
+    echo '远程拒绝服务验证完成'
+
+files:
+  - name: exp.sh
+    desc: "漏洞利用（触发远程 DoS）"
+    category: exploit
+    end_marker: "EXP 完成"
+    rules:
+      - "不使用 set -e"
+      - "触发前检查服务状态，触发后再次检查——展示前后对比"
+      - "输出以 EXP 完成 结尾"
+
+  - name: verify.sh
+    desc: "验证脚本（三段式）"
+    category: verify
+    end_marker: "echo '远程拒绝服务验证完成'"
+    rules:
+      - "三段式：阶段 1 攻击前状态 → 阶段 2 触发 DoS → 阶段 3 不可用验证"
+      - "🔴 阶段 3 必须有不可用硬证据（HTTP 000/端口拒绝/进程消失）"
+      - "无不可用证据 → 判定失败"
+      - "用 ✅/❌ 标记验证结果"
+
+inject_on_write:
+  verify.sh:
+    pre_check: |
+      🔴 你即将写入 verify.sh。目标类型: remote_denial_of_service。写入前必须确认：
+
+      1. 三段式：阶段 1 攻击前状态 → 阶段 2 触发 DoS → 阶段 3 不可用验证
+      2. 🔴 阶段 3 必须有不可用硬证据（HTTP 000/timeout/端口拒绝）
+      3. 如果服务仍正常 → 判定❌失败
+      4. 不使用 set -e
+      5. 最后一行严格等于 echo '远程拒绝服务验证完成'
+      6. 🔴 [DoS v2] 模式选择：
+         - 如果 DoS 类型是**进程崩溃型/OOM** → 用顺序模式（阶段 2 同步运行 exp.sh）
+         - 如果 DoS 类型是 **ReDoS/CPU 耗尽/连接耗尽/内存泄漏**（进程不死亡）
+           → 必须用并发模式，用 concurrent_skeleton 替代 skeleton。
+           并发模式：exp.sh 后台启动（&），期间并发健康探测，
+           将结果写入 /tmp/dos_checker.json（框架自动解析）。
+           保留 __DOS_WINDOW__ 占位符（框架在 execute 时替换）。
+
+    post_check: |
+      🔴 verify.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否选择了正确的 DoS 验证模式？□
+         → 如果选错 → 用 write_file 重写
+      2. 是否包含了不可用证据检查？□
+         → 如果没有 → 用 write_file 重写
+      3. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      4. 最后一行是否严格等于 echo '远程拒绝服务验证完成'？□
+         → 如果不是 → 删除末尾多余行，用 write_file 重写
+      5. 🔴 Web DoS 类型：阶段 2/3 是否使用了 docker_stats / qemu_resource_stats / remote_resource_stats
+         采集资源指标？□
+         → 如果没有 → 在阶段 2 和阶段 3 添加资源采集，用 write_file 重写
+         → 如果只有阶段 1 采集（无阶段 2/3）→ 补全，用 write_file 重写
+      6. [并发模式] 是否保留了 __DOS_WINDOW__ 占位符？□
+         → 如果手动替换成了固定数字 → 恢复为 __DOS_WINDOW__（框架在 execute 时自动替换）
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+  exp.sh:
+    pre_check: |
+      🔴 你即将写入 exp.sh。目标类型: remote_denial_of_service。写入前必须确认：
+
+      1. 不使用 set -e，清理命令加 2>/dev/null || true
+      2. 触发前检查服务状态，触发后再次检查——展示前后对比
+      3. 最后一行输出严格等于 EXP 完成
+      4. 🔴 [并发模式] 如果 DoS 子类型是 CPU 耗尽型/连接耗尽型/内存泄漏型：
+         - exp.sh 必须包含持续攻击循环，不只发几条请求就退出
+         - 如果写了 /tmp/attacker.py，exp.sh 必须在攻击阶段调用它
+         - 如果是数据库查询型（LIKE %...%），先检查数据量，不足则注入 seed data
+
+    post_check: |
+      🔴 exp.sh 写入完成。现在立即 read_file 读回该文件，逐条自检：
+
+      1. 是否有 set -e？□
+         → 如果有 → 删除，用 write_file 重写
+      2. 最后一行是否严格等于 EXP 完成？□
+         → 如果不是或为裸文本 → 改为 echo "EXP 完成"，用 write_file 重写
+      3. 是否展示了服务状态前后对比？□
+         → 如果没有 → 用 write_file 重写
+      4. 🔴 [并发模式/持续负载型] exp.sh 是否只发了少量请求就退出了？□
+         → 如果是 → 改为持续攻击循环（调用 /tmp/attacker.py 或内联循环），重写
+      5. 🔴 [并发模式/数据库查询型] 是否检查了数据量并在需要时注入 seed data？□
+         → 如果需要但没做 → 加入数据注入步骤，重写
+      6. 🔴 [并发模式] 如果写了 /tmp/attacker.py，exp.sh 是否调用了它（而非只让 verify.sh 调用）？□
+         → 如果没有 → 在 exp.sh 中加入调用，重写
+
+      🔴 任一 □ 打叉 → 立即重写。全部通过后才能继续下一步。
+
+      7. `bash -n` 语法检查是否通过？□
+         → 如果不通过 → 修正语法错误，用 write_file 重写
+
+      8. exp.sh 开头是否清理了 CVE_WORKDIR 工作空间？□
+         → 如果没有 → 在开头加 rm -rf "$CVE_WORKDIR" && mkdir -p "$CVE_WORKDIR"，用 write_file 重写
+      9. 如果 exp.sh 包含编译命令（go build/gcc/mvn），是否用 background=True 启动而非 timeout 等待？□
+         → 如果是同步编译 → 改为 background=True 启动 + 轮询检查二进制
+checks:
+  - name: "exp.sh 成功触发 DoS 并展示了服务状态变化，最后一行是 EXP 完成"
+    on_fail: "确保 exp.sh 展示服务前后状态对比，最后一行严格等于 EXP 完成"
+  - name: "verify.sh 阶段 1 展示了服务存活证明，未使用 whoami/id"
+    on_fail: "在 verify.sh 阶段 1 用 curl/ss 检查服务状态，不要用 whoami/id"
+  - name: "verify.sh 最后一行严格等于 end_marker，无多余 exit/echo/空行"
+    on_fail: "删除 verify.sh 末尾多余的 exit/echo/空行"
